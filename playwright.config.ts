@@ -4,21 +4,22 @@ export default defineConfig({
   testDir: "tests/e2e",
   timeout: 45_000,
   use: {
-    baseURL: "http://127.0.0.1:4173",
+    baseURL: "http://127.0.0.1:4273",
     trace: "on-first-retry",
     ...devices["Desktop Chrome"],
   },
   webServer: [
     {
-      command: "npm run dev:demo",
-      url: "http://127.0.0.1:4173/health",
-      reuseExistingServer: true,
+      command: "DEMO_PORT=4273 npm run dev:demo",
+      url: "http://127.0.0.1:4273/health",
+      reuseExistingServer: false,
       timeout: 30_000,
     },
     {
-      command: "npm run dev:studio",
-      url: "http://127.0.0.1:3000/health",
-      reuseExistingServer: true,
+      command:
+        "STUDIO_PORT=3100 DEMO_SITE_INTERNAL_URL=http://127.0.0.1:4273 DEMO_SITE_PUBLIC_URL=http://127.0.0.1:4273 npm run dev:studio",
+      url: "http://127.0.0.1:3100/health",
+      reuseExistingServer: false,
       timeout: 30_000,
     },
   ],

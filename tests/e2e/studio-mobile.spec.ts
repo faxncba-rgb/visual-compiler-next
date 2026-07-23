@@ -9,7 +9,7 @@ test.use({
 });
 
 test("Studio remains usable at an iPhone Safari viewport", async ({ page }) => {
-  const health = await page.request.get("http://127.0.0.1:3000/health");
+  const health = await page.request.get("http://127.0.0.1:3100/health");
   await expect(health).toBeOK();
   expect(await health.json()).toMatchObject({
     ok: true,
@@ -17,7 +17,7 @@ test("Studio remains usable at an iPhone Safari viewport", async ({ page }) => {
     runtimeOpenAIAllowed: false,
   });
 
-  await page.goto("http://127.0.0.1:3000");
+  await page.goto("http://127.0.0.1:3100");
 
   await expect(
     page.getByRole("heading", { name: "Visual Compiler" }),
@@ -48,7 +48,7 @@ test("Studio remains usable at an iPhone Safari viewport", async ({ page }) => {
   expect(layout.compileHeight).toBeGreaterThanOrEqual(44);
   expect(layout.columns.split(" ")).toHaveLength(1);
 
-  const replay = await page.request.post("http://127.0.0.1:3000/api/run", {
+  const replay = await page.request.post("http://127.0.0.1:3100/api/run", {
     data: {
       variant: "A",
       visible: false,

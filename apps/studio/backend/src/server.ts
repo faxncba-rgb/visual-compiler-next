@@ -1,9 +1,17 @@
 import express from "express";
 import { constants, existsSync } from "node:fs";
-import { access, mkdir, readdir, readFile } from "node:fs/promises";
+import { access, chmod, mkdir, readdir, readFile, rm } from "node:fs/promises";
+import { homedir } from "node:os";
 import path from "node:path";
 import { compileWorkflow } from "@visual-compiler/compiler";
 import { runCompiledWorkflow } from "@visual-compiler/runtime";
+import {
+  browserProfiles,
+  localFixtureProfile,
+  ncbaDpiProfile,
+  requireValidAttestation,
+  validateTargetUrl,
+} from "@visual-compiler/clinical-safety";
 import {
   DEFAULT_DEMO_INTERNAL_URL,
   DEFAULT_DEMO_PUBLIC_URL,
@@ -15,6 +23,21 @@ import {
 const port = Number(process.env.STUDIO_PORT ?? 3000);
 const host = process.env.STUDIO_HOST ?? "0.0.0.0";
 const defaultWorkflowId = path.basename(WORKFLOW_PATH, ".json");
+const browserProfileRoot = path.resolve(
+  process.env.VISUAL_COMPILER_BROWSER_PROFILE_ROOT ??
+    path.join(
+      homedir(),
+      "Library",
+      "Application Support",
+      "Visual Compiler Next",
+      "browser-profiles",
+    ),
+);
+if (
+  browserProfileRoot.startsWith(`${path.resolve(process.cwd())}${path.sep}`)
+) {
+  throw new Error("Browser profile storage must be outside the repository.");
+}
 
 function normalizedBaseUrl(value: string, variableName: string) {
   try {
@@ -56,6 +79,17 @@ function demoUrl(baseUrl: string, variant: "A" | "B") {
 async function ensureWorkflowStorage() {
   await mkdir(WORKFLOW_STORAGE_DIR, { recursive: true });
   await access(WORKFLOW_STORAGE_DIR, constants.R_OK | constants.W_OK);
+}
+
+async function ensureBrowserProfileDirectory(mode: "training" | "clinical") {
+  await mkdir(browserProfileRoot, { recursive: true, mode: 0o700 });
+  await chmod(browserProfileRoot, 0o700);
+  const profileDirectory = path.join(
+    browserProfileRoot,
+    browserProfiles[mode].storageDirectoryName,
+  );
+  await mkdir(profileDirectory, { recursive: true, mode: 0o700 });
+  await chmod(profileDirectory, 0o700);
 }
 
 function workflowArtifactPath(workflowId: string) {
@@ -137,6 +171,12 @@ function studioHtml() {
     .ok { color: #64d790; }
     .warn { color: #f0bd59; }
     .error { color: #ff8585; }
+    .mode-panel { border: 2px solid #d4a832; border-radius: 9px; padding: 14px; margin: 16px 0; background: #272315; }
+    .mode-panel.clinical { border-color: #d75252; background: #2b181b; }
+    .mode-title { font-weight: 900; letter-spacing: .08em; }
+    .attestation { display: grid; gap: 8px; margin-top: 12px; font-size: 13px; }
+    .attestation label { display: grid; grid-template-columns: 22px 1fr; gap: 6px; align-items: start; }
+    input[type="url"] { width: 100%; min-height: 44px; border: 1px solid #3b4555; background: #171b22; color: white; border-radius: 7px; padding: 10px; font-size: 16px; }
     @media (max-width: 980px) {
       .app { grid-template-columns: 1fr; min-height: auto; }
       aside, section { border-right: 0; border-bottom: 1px solid #2a3039; }
@@ -165,7 +205,21 @@ function studioHtml() {
   <main class="app">
     <aside class="left">
       <h1>Visual Compiler</h1>
-      <p class="tagline">Compile AI once. Execute forever.</p>
+      <p class="tagline">Compile on synthetic data. Execute on real workflows.</p>
+      <section class="mode-panel" aria-label="Training Compilation">
+        <div class="mode-title">TRAINING MODE</div>
+        <strong>SYNTHETIC DATA ONLY</strong><br><strong>GPT-5.6 COMPILATION ENABLED</strong>
+        <label for="targetUrl">Target Website URL</label>
+        <input id="targetUrl" type="url" value="http://127.0.0.1:4173/ncba-fixture?mode=training&amp;variant=A">
+        <div class="attestation" aria-label="Synthetic data attestation">
+          <strong>I confirm that:</strong>
+          <label><input type="checkbox"> <span>I am authorized to automate this training environment.</span></label>
+          <label><input type="checkbox"> <span>This browser session contains synthetic data only.</span></label>
+          <label><input type="checkbox"> <span>No real patient data is visible.</span></label>
+          <label><input type="checkbox"> <span>No credential or secret may be sent to OpenAI.</span></label>
+          <label><input type="checkbox"> <span>The workflow is administrative and reversible.</span></label>
+        </div>
+      </section>
       <h2>Instruction</h2>
       <textarea id="instruction" aria-label="Workflow instruction">${escapeHtml(DEFAULT_INSTRUCTION)}</textarea>
       <div class="row">
@@ -176,6 +230,20 @@ function studioHtml() {
         <button class="secondary" id="runB">Run B</button>
       </div>
       <p class="hint">Run A/B opens a separate visible Chromium replay. The iframe remains an independent preview.</p>
+      <section class="mode-panel clinical" aria-label="Clinical Runtime">
+        <div class="mode-title">CLINICAL RUNTIME</div>
+        <strong>OPENAI ACCESS FORBIDDEN</strong><br><strong>PROMOTED WORKFLOWS ONLY</strong>
+        <label for="promotedWorkflow">Promoted workflow</label>
+        <select id="promotedWorkflow" aria-label="Promoted workflow"><option>No promoted NCBA workflow</option></select>
+        <p class="hint">Hash verification: pending<br>Structural compatibility: pending<br>Runtime LLM calls: 0<br>OpenAI requests: 0</p>
+        <pre aria-label="Planned clinical actions">No actions — preflight required.</pre>
+        <label><input type="checkbox" id="clinicalConfirmation"> I reviewed the planned reversible administrative actions.</label>
+        <button type="button" id="clinicalPreflight">Preflight</button>
+        <button type="button" id="clinicalRun" disabled>Run promoted workflow</button>
+        <button type="button" id="clinicalStop">Emergency Stop</button>
+        <button type="button" id="deleteClinicalProfile">Delete local clinical browser profile</button>
+        <p class="hint">Redacted local audit is created only after an authorized promoted run. Compilation is not exposed in this mode.</p>
+      </section>
       <div style="margin-top:18px" aria-live="polite">
         <div class="metric"><span>Compile-time model calls</span><strong id="compileCalls">0</strong></div>
         <div class="metric"><span>Compile response model</span><strong id="compileModel">-</strong></div>
@@ -296,6 +364,15 @@ function studioHtml() {
     }
     document.getElementById("runA").addEventListener("click", () => run("A"));
     document.getElementById("runB").addEventListener("click", () => run("B"));
+    document.getElementById("clinicalStop").addEventListener("click", () => {
+      setStatus("Clinical run stopped", "warn");
+    });
+    document.getElementById("deleteClinicalProfile").addEventListener("click", async () => {
+      if (!window.confirm("Delete the independent local clinical browser profile?")) return;
+      const response = await fetch("/api/browser-profiles/clinical", { method: "DELETE" });
+      const result = await response.json();
+      setStatus(response.ok ? result.status : result.error, response.ok ? "ok" : "error");
+    });
     workflowSelect.addEventListener("change", () => {
       loadWorkflow(workflowSelect.value).catch(error => {
         setStatus("Failed", "error");
@@ -351,8 +428,58 @@ app.get("/health", async (_req, res) => {
     });
   }
 });
+app.get("/api/application-profiles", (_req, res) => {
+  res.json({
+    profiles: [localFixtureProfile, ncbaDpiProfile],
+    browserProfiles,
+  });
+});
+app.delete("/api/browser-profiles/:mode", async (req, res) => {
+  const mode = req.params.mode;
+  if (mode !== "training" && mode !== "clinical") {
+    res.status(400).json({ error: "Unknown browser profile mode." });
+    return;
+  }
+  const profileDirectory = path.join(
+    browserProfileRoot,
+    browserProfiles[mode].storageDirectoryName,
+  );
+  await rm(profileDirectory, { recursive: true, force: true });
+  res.json({ status: `${mode} browser profile deleted` });
+});
+app.post("/api/browser-profiles/:mode/prepare", async (req, res) => {
+  const mode = req.params.mode;
+  if (mode !== "training" && mode !== "clinical") {
+    res.status(400).json({ error: "Unknown browser profile mode." });
+    return;
+  }
+  await ensureBrowserProfileDirectory(mode);
+  res.json({
+    status: `${mode} browser profile prepared`,
+    permissions: "0700",
+    compilationAllowed: browserProfiles[mode].compilationAllowed,
+  });
+});
+app.post("/api/clinical/compile", (_req, res) => {
+  res
+    .status(403)
+    .json({ error: "Compilation is technically disabled in clinical mode." });
+});
 app.post("/api/compile", async (req, res) => {
   try {
+    if (req.body.mode === "clinical") {
+      res.status(403).json({
+        error: "Compilation is technically disabled in clinical mode.",
+      });
+      return;
+    }
+    if (req.body.applicationProfileId === "ncba-dpi") {
+      requireValidAttestation(req.body.syntheticAttestation, ncbaDpiProfile);
+      validateTargetUrl(String(req.body.targetUrl ?? ""), {
+        mode: "training",
+        profile: ncbaDpiProfile,
+      });
+    }
     const instruction =
       typeof req.body.instruction === "string"
         ? req.body.instruction.trim()
