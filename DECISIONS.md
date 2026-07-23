@@ -1,5 +1,13 @@
 # Decisions
 
+## 2026-07-22 — Post-hackathon safety boundary
+
+- Preserve Build Week Git history in a new repository and disable pushes to `upstream-build-week`.
+- Treat identical training and clinical origins as insufficient evidence of mode; require isolated browser state and explicit mode.
+- Use SHA-256 for the first promoted-artifact MVP; defer Ed25519 until key management is reliable.
+- Keep the NCBA compatibility probe disabled and never contact the real target during development or CI.
+- Require a local synthetic marker plus complete expiring attestation before NCBA compilation.
+
 ## ADR-001: Separate Compile Time From Runtime
 
 Date: 2026-07-18

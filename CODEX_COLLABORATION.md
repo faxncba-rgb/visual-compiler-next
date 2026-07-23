@@ -1,5 +1,13 @@
 # Codex Collaboration
 
+## Post-hackathon continuation — 2026-07-22
+
+Codex created a separate repository while preserving Build Week history. It must never push to `upstream-build-week`, read external browser-profile state, request credentials, contact the NCBA DPI, or run live OpenAI compilation without a new explicit authorization.
+
+All development and CI use `ncba-dpi-fixture`. The repository records only redacted structures and synthetic test markers. The compatibility probe is code-only and disabled. Before publishing, Codex runs the full test suite, probable-secret scan, tracked-file review, and remote verification.
+
+The 2026-07-23 validation completed with build success, 36/36 tests, the focused 8/8 security suite, a clean scan of 75 repository files, and 8/8 E2E tests. E2E uses isolated loopback ports and never contacts the declared NCBA origin.
+
 ## Components Codex Designed
 
 - Monorepo structure separating compile-time and runtime packages.

@@ -1,30 +1,11 @@
-# Security And Ethics
+# Security and privacy
 
-Visual Compiler is a developer tool for authorized browser automation.
+The clinical runtime never imports or depends on OpenAI. It runs with `OPENAI_API_KEY` absent, blocks HTTP and WebSocket traffic to OpenAI domains, blocks service workers, performs no LLM repair, and reports `llmCalls: 0` and `openAIRequests: 0`.
 
-It does not include CAPTCHA bypass, credential theft, stealth automation, anti-detection methods, unauthorized access, financial transaction execution, medical decision automation, or bypass of user consent.
+Compilation is permitted only in training mode after complete, unexpired synthetic-data attestation and verification of a locally configured synthetic marker. Clinical compilation is refused by the backend, not merely hidden in Studio.
 
-Compiled workflows do not store API keys. `OPENAI_API_KEY` is optional and is
-passed only to the server-side Studio service. It is never embedded in the
-Studio HTML, iframe URL, demo container, workflow artifact, or runtime
-telemetry.
+The redaction boundary excludes input, textarea, and contenteditable values; selected values; cookies; local/session storage; request headers; credentials; tokens; form payloads; network responses; screenshots; sensitive URL parameters; and marked sensitive nodes. Reports contain counts only and never removed values.
 
-For local macOS development, `.env` is ignored by Git and should remain a plain
-text file with mode `0600`. Local development commands load it server-side; the
-live demonstration deletes `OPENAI_API_KEY` from its process environment before
-starting runtime replay and again during cleanup.
+Browser profile state must live outside Git under `~/Library/Application Support/Visual Compiler Next/browser-profiles/`, with directories at mode `0700` and files at `0600`. Codex and repository tooling must never read these directories or emit their contents in logs. Studio will provide explicit deletion; until that UI is implemented, the operator may close Studio and manually remove the selected profile directory. Training and clinical profiles must never share state.
 
-The runtime package has no OpenAI dependency. Runtime-controlled browser
-requests to OpenAI hosts are aborted; any attempt fails the run. Successful
-runtime telemetry is possible only with `llmCalls: 0` and
-`openAIRequests: 0`.
-
-The production template publishes no host ports. Traefik is the only ingress,
-the internal Playwright target uses a private Docker network, compiled workflows
-use a persistent named volume, both services have health checks, and Studio
-requires an existing Traefik authentication or IP-allowlist middleware.
-Deployment operators should keep `.env.production` at mode `0600`, avoid
-printing rendered configuration containing secrets, and follow the
-backup/update/rollback procedure in `DEPLOYMENT.md`.
-
-The MVP runs only against a controlled demo site.
+Run `npm run test:security` before every push. It detects probable secrets and forbidden session files, enforces the runtime import boundary, and exercises network safeguards. Do not attach credentials, sessions, screenshots, or patient information to a report.

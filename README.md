@@ -1,199 +1,72 @@
-# Visual Compiler
+# Visual Compiler Next
 
-Compile AI once. Execute forever.
+**Compile on synthetic data. Execute on real workflows.**
 
-Visual Compiler is a Build Week MVP showing that GPT-5.6 can interpret a complex browser instruction at compile time, emit a validated semantic workflow, and replay it later with deterministic Playwright automation and zero runtime model calls.
+Visual Compiler Next is the post-hackathon continuation of [the immutable OpenAI Build Week submission](https://github.com/faxncba-rgb/Visual-compiler-). Development started on **2026-07-22**. Work in this repository is not part of the original Build Week submission.
 
-## Quick Start
+The project compiles an authorized administrative procedure from a synthetic training environment into validated Semantic IR and a deterministic Playwright workflow. A promoted artifact can then be executed locally after a fail-closed structural preflight. Patient data must never be sent to GPT-5.6.
+
+```text
+Synthetic training application
+→ redacted page model
+→ GPT-5.6 compilation
+→ validated Semantic IR
+→ deterministic workflow
+→ validation → human approval → promotion
+→ clinical structural preflight
+→ local deterministic runtime
+→ zero OpenAI calls
+```
+
+## Current MVP
+
+- Strongly typed Application Profiles, including `ncba-dpi` and the local `ncba-dpi-fixture`.
+- Separate visible training and clinical browser-profile definitions.
+- Strict target URL allowlists, protocol and credential checks, redirect checks, and default SSRF denial.
+- Mandatory, expiring synthetic-data attestation with a locally verified synthetic marker.
+- Page-model redaction excluding values, storage, cookies, network data, sensitive URL parameters, and sensitive nodes.
+- Data-independent structural fingerprints and redacted compatibility differences.
+- `Draft → Validated → Approved → Promoted → Revoked` lifecycle with immutable SHA-256 verification.
+- Fail-closed clinical preflight, redacted audit structures, and ephemeral runtime parameters.
+- Local `ncba-dpi-fixture` with fictitious login, synthetic banner, administrative table, and layout variants A/B.
+- Promoted-only runtime entry point validated by a full synthetic workflow replay on fixture variants A/B.
+- Existing Build Week safeguards: no OpenAI import in runtime, OpenAI HTTP/WebSocket blocking, service workers blocked, `llmCalls: 0`, and `openAIRequests: 0`.
+- An optional compatibility-probe contract that is disabled by default and has not been run.
+
+The Studio is a first professional MVP: the security primitives and promoted-only runtime entry point are implemented and tested, while persisted approval/promotion orchestration and authorized clinical browser integration remain future milestones. Ed25519 signing is deferred; promoted artifacts use verified SHA-256.
+
+## Local use
 
 ```bash
-npm install
-cp .env.example .env
+npm ci
+npm run build
+npm test
+npm run test:security
+npm run test:e2e
 npm run dev
 ```
 
-Studio: http://127.0.0.1:3000  
-Demo site: http://127.0.0.1:4173/demo?variant=A
+Studio: `http://127.0.0.1:3000`
+Synthetic fixture: `http://127.0.0.1:4173/ncba-fixture?mode=training&variant=A`
 
-Runtime-only demo, no OpenAI key required:
+CI and tests use local fixtures only. They require no OpenAI key and never contact the NCBA DPI.
 
-```bash
-npm run demo:runtime
-```
+## Non-negotiable safety boundary
 
-## Local GPT-5.6 demo on macOS
+- Training compilation requires explicit authorization, synthetic data, a locally verified marker, and complete fresh attestation.
+- Clinical mode exposes no Compile control and its compilation endpoint returns `403`.
+- The runtime imports no OpenAI SDK, requires no API key, and blocks OpenAI HTTP and WebSocket requests.
+- No automated login, credential handling, cookie/token capture, network-response inspection, persistent clinical screenshot, CAPTCHA/MFA bypass, or real-patient action is supported.
+- No actual DPI workflow has been selected or compiled. The first task must be chosen by the user and institution under [AUTHORIZED_USE.md](AUTHORIZED_USE.md).
 
-The local development commands load `.env` automatically. Create it as a plain
-text file and keep it readable only by your macOS account:
+## Status and limitations
 
-```bash
-cp .env.example .env
-chmod 600 .env
-nano .env
-```
+The real NCBA DPI at `https://dpi-ncba.gbna-sante.fr/` has **not** been contacted or tested. No patient data has been used and no clinical workflow has been executed. Institutional authorization remains mandatory.
 
-In `nano`, save with `Control-O`, press `Return`, then exit with `Control-X`.
-Set `OPENAI_API_KEY`, `USE_LIVE_OPENAI=true`, and
-`OPENAI_COMPILE_MODEL=gpt-5.6`. Never paste the key into source code, a browser
-form, Git, or a support message.
+This project is not RGPD certified, not HDS certified, and not a certified medical device. It is limited to authorized, administrative, reversible automation with human confirmation. It must not perform clinical decisions, prescribing, medical signatures, deletion, billing, or irreversible transactions.
 
-Run one real compilation followed by deterministic replay on variants A and B:
-
-```bash
-npm run demo:live
-```
-
-The command sends the page model and instruction to GPT-5.6 once, writes the
-validated workflow to a new versioned artifact, removes the API key from the
-process environment, then runs both variants with zero OpenAI calls. Existing
-artifacts are never replaced. API billing or credits must be enabled for the API
-project that owns the key; a ChatGPT subscription does not provide API quota.
-
-For the interactive demo, open Studio and click `Run A` or `Run B`. Studio opens
-a separate visible Chromium window because Playwright cannot mutate the
-independent iframe shown in Safari. Actions run with about 500 ms of slow motion,
-and the checked checkbox plus confirmation message remain visible for four
-seconds before Chromium closes. The saved workflow is reused, so visible replay
-performs zero model and OpenAI network calls. Automated tests continue to request
-headless replay explicitly.
-
-Studio lists the saved artifacts by their instruction-derived name. Compile
-creates and selects a new artifact whose id combines an instruction slug with an
-eight-character uniqueness suffix. Run A/B always executes the selected
-artifact. The offline mock accepts only the exact documented demo instruction;
-different instructions require live compilation and are rejected explicitly
-when live compilation is disabled.
-
-## Problem
-
-Browser agents often call a model at every click. That creates latency, cost, nondeterminism, privacy risk, and poor auditability. Traditional automation is deterministic, but it struggles with human spatial instructions like "check the first enabled checkbox to the right of Pending review."
-
-## Solution
-
-Visual Compiler separates intelligence from execution:
-
-```mermaid
-flowchart LR
-  A[DOM + accessibility + screenshot context] --> B[GPT-5.6 compile-time interpreter]
-  B --> C[Validated Semantic IR]
-  C --> D[Deterministic locator compiler]
-  D --> E[Saved workflow artifact]
-  E --> F[Playwright runtime]
-  F --> G[Zero LLM calls]
-```
-
-## Compile Time vs Runtime
-
-| Stage   | Uses GPT-5.6                     | Requires API key     | Output                                            |
-| ------- | -------------------------------- | -------------------- | ------------------------------------------------- |
-| Compile | Yes, when `USE_LIVE_OPENAI=true` | Yes for live compile | Semantic IR + ranked locators + Playwright source |
-| Runtime | No                               | No                   | Deterministic browser actions + telemetry         |
-
-## Demo Instruction
-
-```text
-In the row containing 'Pending review', check the first enabled checkbox to the right of the status text, then click the green confirmation button below the table.
-```
-
-The workflow compiles against layout variant A and replays against variants A and B while preserving semantic relationships.
-
-## Supported MVP Actions
-
-`click`, `check`, `uncheck`, `fill`, `select`, `wait`, `assert`.
-
-Supported relations include right of, left of, above, below, same row, same column, nearest, first matching, second matching, enabled-only, and visible-only.
-
-## Repository Structure
-
-```text
-apps/demo-site          Controlled page with layout variants A and B
-apps/studio             Local studio UI and backend API
-packages/semantic-ir    Zod schemas for validated IR
-packages/page-model     DOM/accessibility/geometry extraction
-packages/spatial        Deterministic geometry utilities
-packages/locator-engine Candidate generation and ranking
-packages/compiler       GPT-5.6 compile-time interpreter and codegen
-packages/runtime        Playwright runtime with no OpenAI dependency
-compiled-workflows      Saved deterministic artifacts
-tests                   Unit, integration, and E2E tests
-DEPLOYMENT.md            Hostinger VPS deployment, update, and rollback guide
-```
-
-## Testing
-
-```bash
-npm test
-npm run test:e2e
-```
-
-If Playwright reports that Chromium is missing, run:
-
-```bash
-npx playwright install chromium
-```
-
-The project pins Playwright and its production browser image to `1.61.1`.
-
-In restricted sandboxes where npm cannot write to `/root/.npm`, use:
-
-```bash
-npm --cache /tmp/npm-cache install
-```
-
-## Security and Privacy
-
-The runtime package has no OpenAI SDK dependency, compiled workflows do not
-store API keys, and runtime telemetry reports `llmCalls: 0`. The runtime also
-blocks browser requests to OpenAI hosts and fails the run if a page attempts one.
-This project is intended only for authorized browser automation.
-
-## Optional, unvalidated deployment template
-
-The repository includes a production [Dockerfile](Dockerfile) and
-[Traefik-compatible Compose template](compose.production.yml). The image contains
-the matching Chromium build and Linux dependencies. Compiled workflows are
-stored in a named volume.
-
-Production keeps two URLs intentionally separate:
-
-- `DEMO_SITE_INTERNAL_URL` is reachable only by server-side Playwright.
-- `DEMO_SITE_PUBLIC_URL` is the HTTPS URL loaded by the Studio iframe.
-
-See [DEPLOYMENT.md](DEPLOYMENT.md) for preparation, health verification,
-credential handling, safe updates, backups, and rollback. The template has not
-been validated with Docker or deployed to a VPS. Current work is intentionally
-limited to the local macOS demonstration.
-
-## Limitations
-
-This MVP is a controlled vertical slice. The demo page exposes buttons,
-checkboxes, and spatially varied table rows. `fill` and `select` are implemented
-in the runtime; `select` is covered with a synthetic test page because the
-controlled demo has no combobox. Locator compilation uses one primary spatial
-relation plus accessible role/name information. Final-state evidence verifies
-state-changing actions and declared postconditions; it does not invent
-undeclared page outcomes. The offline interpreter is a single-fixture test
-double, not a general natural-language interpreter.
-
-The project does not target arbitrary public websites, CAPTCHA solving,
-authentication bypass, stealth automation, or high-risk transaction flows.
-
-## Build Week Track
-
-Primary: Developer Tools. Secondary: Work and Productivity, agentic workflows, browser automation infrastructure, testing and RPA tooling.
-
-## How Codex Was Used
-
-Codex designed and implemented the monorepo, deterministic runtime, demo page, schemas, tests, and documentation drafts from the product prompt.
-
-## How GPT-5.6 Is Used
-
-GPT-5.6 is used only during compilation to interpret the instruction into strict validated JSON. Runtime execution loads the compiled artifact and uses Playwright without model access.
+See [SYNTHETIC_TO_CLINICAL.md](SYNTHETIC_TO_CLINICAL.md), [CLINICAL_RUNTIME.md](CLINICAL_RUNTIME.md), [SECURITY.md](SECURITY.md), and [THREAT_MODEL.md](THREAT_MODEL.md).
 
 ## License
 
 MIT.
-
-## Authors
-
-Project authorship placeholder.

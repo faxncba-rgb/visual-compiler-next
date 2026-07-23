@@ -1,5 +1,16 @@
 # Progress
 
+## 2026-07-22 — Post-hackathon synthetic-to-clinical foundation
+
+- Created `visual-compiler-next` from the immutable Build Week history on branch `post-hackathon/synthetic-to-clinical`.
+- Configured `upstream-build-week` with push disabled and the new GitHub repository as `origin`.
+- Implemented Application Profiles, strict URL validation, synthetic attestation, redaction, structural fingerprints, lifecycle/hash, clinical preflight, redacted audit, and ephemeral parameters.
+- Added distinct Training and Clinical Studio surfaces and backend `403` refusal for clinical compilation.
+- Added `ncba-dpi-fixture` variants A/B plus unit, integration, security, and E2E coverage.
+- Compatibility probe contract is disabled and was not executed. The real DPI was not contacted. No patient data, credential, clinical workflow, or OpenAI call was used.
+- Final validation on 2026-07-23: `npm ci`, `npm run build`, 36/36 tests, 8/8 focused security tests plus the 75-file secret/import scan, and 8/8 Playwright E2E tests passed.
+- Matching Playwright Chromium 1.61.1 was already installed locally. A redundant download attempt was stopped after the restricted network produced no progress; the existing matching browser completed E2E successfully.
+
 ## Completed Milestones
 
 - Milestone 0: repository setup, lint/format baseline, TypeScript config, test
