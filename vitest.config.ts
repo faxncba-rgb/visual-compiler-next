@@ -25,6 +25,9 @@ export default defineConfig({
       "@visual-compiler/compiler": fromRoot("./packages/compiler/src/index.ts"),
       "@visual-compiler/runtime": fromRoot("./packages/runtime/src/index.ts"),
       "@visual-compiler/shared": fromRoot("./packages/shared/src/index.ts"),
+      "@visual-compiler/clinical-safety": fromRoot(
+        "./packages/clinical-safety/src/index.ts",
+      ),
     },
   },
 });

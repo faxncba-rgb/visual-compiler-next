@@ -18,6 +18,43 @@ export const InterpreterResponseSchema = z.object({
 
 export type InterpreterResponse = z.infer<typeof InterpreterResponseSchema>;
 
+export function createRedactedCompilerPageModel(model: PageModel) {
+  const url = new URL(model.url);
+  return {
+    origin: url.origin,
+    path: url.pathname,
+    viewport: model.viewport,
+    nodes: model.nodes.map((node, structuralIndex) => ({
+      structuralIndex,
+      tagName: node.tagName,
+      role: node.role,
+      stableLabel: node.attributes["data-vc-stable-label"],
+      controlType: node.attributes.type ?? node.tagName,
+      box: node.box,
+      visible: node.visible,
+      enabled: node.enabled,
+      checked: node.checked,
+    })),
+    redactionReport: {
+      fieldsRemoved: model.nodes.reduce(
+        (count, node) => count + Object.keys(node.attributes).length,
+        0,
+      ),
+      valuesRemoved: model.nodes.reduce(
+        (count, node) =>
+          count +
+          Number(Boolean(node.text)) +
+          Number(Boolean(node.accessibleName)),
+        0,
+      ),
+      sensitiveNodesRemoved: 0,
+      cookiesCaptured: false as const,
+      storageCaptured: false as const,
+      networkCaptured: false as const,
+    },
+  };
+}
+
 const InterpreterRelationSchema = z.object({
   relation: z.enum([
     "next-to",
@@ -215,6 +252,7 @@ export async function interpretInstructionWithOpenAI(
     throw new Error("OPENAI_API_KEY is required for live GPT-5.6 compilation.");
   }
   const client = new OpenAI();
+  const redactedPageModel = createRedactedCompilerPageModel(model);
   const response = await client.responses.parse({
     model: process.env.OPENAI_COMPILE_MODEL ?? "gpt-5.6",
     store: false,
@@ -229,21 +267,7 @@ export async function interpretInstructionWithOpenAI(
         role: "user",
         content: JSON.stringify({
           instruction,
-          pageModel: {
-            url: model.url,
-            viewport: model.viewport,
-            nodes: model.nodes.map((node) => ({
-              id: node.id,
-              role: node.role,
-              accessibleName: node.accessibleName,
-              text: node.text,
-              box: node.box,
-              visible: node.visible,
-              enabled: node.enabled,
-              checked: node.checked,
-              color: node.color,
-            })),
-          },
+          pageModel: redactedPageModel,
         }),
       },
     ],

@@ -1,13 +1,11 @@
 {
-  "name": "@visual-compiler/runtime",
+  "name": "@visual-compiler/clinical-safety",
   "version": "0.1.0",
   "type": "module",
   "exports": {
     ".": "./src/index.ts"
   },
   "dependencies": {
-    "@visual-compiler/clinical-safety": "0.1.0",
-    "playwright": "1.61.1",
     "zod": "^4.1.13"
   }
 }

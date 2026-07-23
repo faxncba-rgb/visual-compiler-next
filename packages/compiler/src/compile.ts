@@ -165,6 +165,7 @@ export async function compileWorkflow(
 }
 
 export {
+  createRedactedCompilerPageModel,
   InterpreterResponseSchema,
   interpreterResponseFormat,
   mockInterpretInstruction,

@@ -1,6 +1,6 @@
 {
-  "name": "visual-compiler",
-  "version": "0.1.0",
+  "name": "visual-compiler-next",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "workspaces": [
@@ -17,6 +17,7 @@
     "demo:live": "node --env-file=.env --import tsx scripts/live-demo.ts",
     "demo:runtime": "node --import tsx scripts/demo-runtime.ts",
     "test": "vitest run",
+    "test:security": "vitest run tests/integration/runtime-safeguards.test.ts tests/integration/clinical-security.test.ts && node --import tsx scripts/security-check.ts",
     "test:e2e": "playwright test",
     "build": "tsc --noEmit",
     "format": "prettier --write ."

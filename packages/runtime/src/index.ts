@@ -6,6 +6,12 @@ import {
   type SemanticWorkflow,
   type RuntimeTelemetry,
 } from "@visual-compiler/semantic-ir";
+import {
+  clinicalPreflight,
+  type ApplicationProfile,
+  type PromotedWorkflow,
+  type StructuralFingerprint,
+} from "@visual-compiler/clinical-safety";
 
 export type RuntimeOptions = {
   workflowPath: string;
@@ -20,6 +26,11 @@ type RuntimeExecutionOptions = {
   slowMo?: number;
   keepOpenMs?: number;
 };
+
+export function isOpenAIHostname(hostname: string) {
+  const normalized = hostname.toLowerCase().replace(/\.$/, "");
+  return normalized === "openai.com" || normalized.endsWith(".openai.com");
+}
 
 async function resolveSemanticLocator(
   page: Page,
@@ -269,7 +280,7 @@ export async function runWorkflowObject(
   let blockedOpenAIRequests = 0;
   await page.route("**/*", async (route) => {
     const hostname = new URL(route.request().url()).hostname.toLowerCase();
-    if (hostname === "openai.com" || hostname.endsWith(".openai.com")) {
+    if (isOpenAIHostname(hostname)) {
       blockedOpenAIRequests += 1;
       await route.abort("blockedbyclient");
       return;
@@ -279,7 +290,7 @@ export async function runWorkflowObject(
   await page.routeWebSocket(
     (candidateUrl) => {
       const hostname = candidateUrl.hostname.toLowerCase();
-      return hostname === "openai.com" || hostname.endsWith(".openai.com");
+      return isOpenAIHostname(hostname);
     },
     async (webSocket) => {
       blockedOpenAIRequests += 1;
@@ -345,3 +356,44 @@ export async function runCompiledWorkflow(options: RuntimeOptions) {
     keepOpenMs: options.keepOpenMs,
   });
 }
+
+export async function runPromotedWorkflowObject(input: {
+  workflow: SemanticWorkflow;
+  promotion: PromotedWorkflow;
+  profile: ApplicationProfile;
+  url: string;
+  actualFingerprint: StructuralFingerprint;
+  targetsUnique: boolean;
+  preconditionsPassed: boolean;
+  humanConfirmed: boolean;
+  options?: RuntimeExecutionOptions;
+}) {
+  if (
+    input.workflow.id !== input.promotion.workflowId ||
+    input.workflow.version !== input.promotion.workflowVersion
+  ) {
+    throw new Error("Promoted metadata does not match the workflow identity.");
+  }
+  const preflight = clinicalPreflight({
+    workflow: input.promotion,
+    profile: input.profile,
+    url: input.url,
+    actualFingerprint: input.actualFingerprint,
+    targetsUnique: input.targetsUnique,
+    preconditionsPassed: input.preconditionsPassed,
+    humanConfirmed: input.humanConfirmed,
+  });
+  if (!preflight.allowed) {
+    throw new Error(
+      `Clinical preflight failed: ${preflight.failures.join(", ")}.`,
+    );
+  }
+  const telemetry = await runWorkflowObject(
+    input.workflow,
+    input.url,
+    input.options,
+  );
+  return { preflight, telemetry };
+}
+
+export * from "./compatibilityProbe.js";
