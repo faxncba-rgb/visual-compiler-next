@@ -13,6 +13,8 @@ import {
 import { SemanticWorkflowSchema } from "@visual-compiler/semantic-ir";
 import { DEFAULT_INSTRUCTION, WORKFLOW_PATH } from "@visual-compiler/shared";
 
+const demoOrigin = process.env.E2E_DEMO_ORIGIN ?? "http://127.0.0.1:4273";
+
 async function sha256(filePath: string) {
   return createHash("sha256")
     .update(await readFile(filePath))
@@ -23,7 +25,7 @@ test("compiled workflow replays on variants A and B with zero runtime LLM calls"
   const workflowPath = testInfo.outputPath("pending-review.workflow.json");
   await compileWorkflow({
     instruction: DEFAULT_INSTRUCTION,
-    url: "http://127.0.0.1:4173/demo?variant=A",
+    url: `${demoOrigin}/demo?variant=A`,
     outPath: workflowPath,
     headless: true,
   });
@@ -31,7 +33,7 @@ test("compiled workflow replays on variants A and B with zero runtime LLM calls"
   for (const variant of ["A", "B"] as const) {
     const telemetry = await runCompiledWorkflow({
       workflowPath,
-      url: `http://127.0.0.1:4173/demo?variant=${variant}`,
+      url: `${demoOrigin}/demo?variant=${variant}`,
       headless: true,
     });
     expect(telemetry.llmCalls).toBe(0);
@@ -47,7 +49,7 @@ test("tracked GPT-5.6 artifact replays on variants A and B without OpenAI", asyn
   for (const variant of ["A", "B"] as const) {
     const telemetry = await runCompiledWorkflow({
       workflowPath: WORKFLOW_PATH,
-      url: `http://127.0.0.1:4173/demo?variant=${variant}`,
+      url: `${demoOrigin}/demo?variant=${variant}`,
       headless: true,
     });
     expect(telemetry.llmCalls).toBe(0);
@@ -80,7 +82,7 @@ test("two instructions create distinct versioned artifacts without replacing the
   });
   const first = await compileWorkflow({
     instruction: DEFAULT_INSTRUCTION,
-    url: "http://127.0.0.1:4173/demo?variant=A",
+    url: `${demoOrigin}/demo?variant=A`,
     outDir,
     headless: true,
     interpreter: fixtureInterpreter,
@@ -88,7 +90,7 @@ test("two instructions create distinct versioned artifacts without replacing the
   const second = await compileWorkflow({
     instruction:
       "Check the Invoice packet primary checkbox, then click Confirm selection.",
-    url: "http://127.0.0.1:4173/demo?variant=A",
+    url: `${demoOrigin}/demo?variant=A`,
     outDir,
     headless: true,
     interpreter: fixtureInterpreter,
