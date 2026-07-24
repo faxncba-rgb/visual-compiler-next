@@ -2,8 +2,8 @@ export type FixtureMode = "training" | "clinical";
 export type FixtureVariant = "A" | "B";
 
 const recordsA = [
-  ["TEST-ADMIN-001", "Document received", "Open"],
-  ["TEST-ADMIN-002", "Identity check queued", "Open"],
+  ["TEST-ADMIN-001", "Pending review", "Open"],
+  ["TEST-ADMIN-002", "Ready", "Open"],
 ] as const;
 const recordsB = [...recordsA].reverse();
 
@@ -22,12 +22,16 @@ body{font:16px system-ui;margin:0;background:#f4f7fa;color:#17212b}.banner{paddi
 <section aria-label="Fictitious login"><h2>Fictitious login</h2><label>Demo account<input aria-label="Demo account" data-vc-stable-label="demo-account" value="" autocomplete="off"></label><button type="button" data-vc-stable-label="manual-sign-in-simulation">Manual sign-in simulation</button></section>
 <table aria-label="Synthetic administrative queue"><caption>Synthetic administrative queue — layout ${variant}</caption><thead><tr><th>Test record</th><th>Administrative status</th><th>Reversible action</th></tr></thead><tbody>
 ${records.map(([id, status, action]) => `<tr><td>${id}</td><td>${status}</td><td><div class="controls"><label><input type="checkbox" data-vc-stable-label="administrative-row-selection" aria-label="${id} selected"> Select</label><button type="button" data-vc-stable-label="reversible-administrative-action" aria-label="${action} ${id}">${action}</button></div></td></tr>`).join("")}
-</tbody></table><p id="result" role="status">No administrative action executed.</p></main>
+</tbody></table><button id="confirmSelection" type="button" data-vc-stable-label="confirm-selection" aria-label="Confirm selection">Confirm selection</button><p id="result" role="status">No administrative action executed.</p></main>
 <script>
   document.querySelectorAll("tbody button").forEach((button) => {
     button.addEventListener("click", () => {
       document.getElementById("result").textContent = "Synthetic administrative action staged";
     });
+  });
+  document.getElementById("confirmSelection").addEventListener("click", () => {
+    const checked = Array.from(document.querySelectorAll("tbody input[type=checkbox]")).some((input) => input.checked);
+    document.getElementById("result").textContent = checked ? "Compiled workflow completed" : "Select a synthetic record first";
   });
 </script></body></html>`;
 }

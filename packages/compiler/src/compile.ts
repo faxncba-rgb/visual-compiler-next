@@ -2,7 +2,7 @@ import { link, mkdir, rm, writeFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { chromium } from "playwright";
-import { extractPageModel } from "@visual-compiler/page-model";
+import { extractPageModel, type PageModel } from "@visual-compiler/page-model";
 import {
   generateCandidates,
   selectBestCandidate,
@@ -22,6 +22,7 @@ export type CompileOptions = {
   outPath?: string;
   outDir?: string;
   headless?: boolean;
+  pageModel?: PageModel;
   interpreter?: typeof interpretInstruction;
 };
 
@@ -54,13 +55,21 @@ export async function compileWorkflow(
   }
   const started = Date.now();
   const identity = createWorkflowIdentity(options.instruction);
-  const browser = await chromium.launch({ headless: options.headless ?? true });
-  const page = await browser.newPage({
-    viewport: { width: 1280, height: 820 },
-  });
-  await page.goto(options.url);
-  const pageModel = await extractPageModel(page);
-  await browser.close();
+  let pageModel = options.pageModel;
+  if (!pageModel) {
+    const browser = await chromium.launch({
+      headless: options.headless ?? true,
+    });
+    const page = await browser.newPage({
+      viewport: { width: 1280, height: 820 },
+    });
+    try {
+      await page.goto(options.url);
+      pageModel = await extractPageModel(page);
+    } finally {
+      await browser.close();
+    }
+  }
 
   const interpretation = await (options.interpreter ?? interpretInstruction)(
     options.instruction,

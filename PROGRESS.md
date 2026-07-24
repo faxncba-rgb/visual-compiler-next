@@ -1,5 +1,17 @@
 # Progress
 
+## 2026-07-24 — Visible managed application profiles
+
+- Added Studio selection and active-mode display for `ncba-dpi-fixture`, `ncba-dpi-training`, and `ncba-dpi-clinical`.
+- Selecting a profile updates local UI state only; external opening requires the explicit managed-browser button and confirmation.
+- Compilation now requires a complete fresh synthetic-environment attestation before any page-model extraction.
+- Clinical compilation and compiler capture are rejected technically.
+- Managed training compilation reuses only an already-open manual page and sends only the existing redacted compiler model.
+- The local fixture now exposes the complete visible journey: capture, mock compilation, validation on A/B, human approval, promotion, structural preflight, promoted execution on A/B, and revocation.
+- Studio displays the redaction report, structural SHA-256, planned actions, preflight result, and `Runtime LLM calls: 0` / `OpenAI requests: 0`.
+- Automated tests remain fixture-only. The NCBA domain was not contacted and no OpenAI call was made.
+- Validation before publication: build, 38/38 tests, 8/8 focused security tests, a 75-file secret/import scan, and 10/10 Playwright E2E tests pass. Final clean-install, formatting, diff, secret, and browser checks are recorded before commit.
+
 ## 2026-07-22 — Post-hackathon synthetic-to-clinical foundation
 
 - Created `visual-compiler-next` from the immutable Build Week history on branch `post-hackathon/synthetic-to-clinical`.

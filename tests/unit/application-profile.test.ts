@@ -2,9 +2,11 @@ import { describe, expect, it } from "vitest";
 import {
   ApplicationProfileSchema,
   browserProfiles,
+  createStudioApplicationProfiles,
   localFixtureProfile,
   ncbaDpiProfile,
   requireValidAttestation,
+  resolveStudioProfileTarget,
   syntheticAttestationStatements,
   validateRedirect,
   validateTargetUrl,
@@ -29,6 +31,44 @@ describe("Application Profiles and safe URL mode", () => {
     expect(browserProfiles.training.id).not.toBe(browserProfiles.clinical.id);
     expect(browserProfiles.training.compilationAllowed).toBe(true);
     expect(browserProfiles.clinical.compilationAllowed).toBe(false);
+  });
+
+  it("exposes the three managed Studio profiles without weakening origins", () => {
+    const profiles = createStudioApplicationProfiles("http://127.0.0.1:4273");
+    expect(profiles.map((profile) => profile.id)).toEqual([
+      "ncba-dpi-fixture",
+      "ncba-dpi-training",
+      "ncba-dpi-clinical",
+    ]);
+    expect(
+      resolveStudioProfileTarget({
+        profileId: "ncba-dpi-training",
+        targetUrl: "https://dpi-ncba.gbna-sante.fr/",
+        purpose: "open",
+      }).profile.managedBrowserOnly,
+    ).toBe(true);
+    expect(() =>
+      resolveStudioProfileTarget({
+        profileId: "ncba-dpi-clinical",
+        targetUrl: "https://dpi-ncba.gbna-sante.fr/",
+        purpose: "compile",
+      }),
+    ).toThrow(/disabled in clinical/);
+    expect(() =>
+      resolveStudioProfileTarget({
+        profileId: "ncba-dpi-clinical",
+        targetUrl: "https://dpi-ncba.gbna-sante.fr/",
+        purpose: "capture",
+      }),
+    ).toThrow(/capture is technically disabled/);
+    expect(() =>
+      resolveStudioProfileTarget({
+        profileId: "ncba-dpi-fixture",
+        targetUrl: "https://example.com/",
+        purpose: "open",
+        fixtureOrigin: "http://127.0.0.1:4273",
+      }),
+    ).toThrow(/origin/);
   });
 
   it("allows only configured origins and paths", () => {

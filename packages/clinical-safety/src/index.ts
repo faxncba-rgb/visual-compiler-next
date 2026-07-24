@@ -100,6 +100,113 @@ export const browserProfiles = {
   },
 };
 
+export const StudioProfileIdSchema = z.enum([
+  "ncba-dpi-fixture",
+  "ncba-dpi-training",
+  "ncba-dpi-clinical",
+]);
+export type StudioProfileId = z.infer<typeof StudioProfileIdSchema>;
+
+export const StudioApplicationProfileSchema = z.object({
+  id: StudioProfileIdSchema,
+  applicationProfileId: z.enum(["ncba-dpi-fixture", "ncba-dpi"]),
+  name: z.string(),
+  mode: z.enum(["training", "clinical"]),
+  defaultUrl: z.string().url(),
+  urlEditable: z.boolean(),
+  managedBrowserOnly: z.boolean(),
+  compilationAllowed: z.boolean(),
+  captureAllowed: z.boolean(),
+  syntheticAttestationRequired: z.boolean(),
+  warning: z.string(),
+});
+export type StudioApplicationProfile = z.infer<
+  typeof StudioApplicationProfileSchema
+>;
+
+export function createStudioApplicationProfiles(
+  fixtureOrigin = localFixtureProfile.trainingOrigins[0],
+): StudioApplicationProfile[] {
+  return [
+    {
+      id: "ncba-dpi-fixture",
+      applicationProfileId: "ncba-dpi-fixture",
+      name: "NCBA DPI fixture — local synthetic",
+      mode: "training",
+      defaultUrl: `${fixtureOrigin}/ncba-fixture?mode=training&variant=A`,
+      urlEditable: true,
+      managedBrowserOnly: false,
+      compilationAllowed: true,
+      captureAllowed: true,
+      syntheticAttestationRequired: true,
+      warning: "SYNTHETIC DATA ONLY — LOCAL FIXTURE.",
+    },
+    {
+      id: "ncba-dpi-training",
+      applicationProfileId: "ncba-dpi",
+      name: "NCBA DPI — authorized synthetic training",
+      mode: "training",
+      defaultUrl: "https://dpi-ncba.gbna-sante.fr/",
+      urlEditable: true,
+      managedBrowserOnly: true,
+      compilationAllowed: true,
+      captureAllowed: true,
+      syntheticAttestationRequired: true,
+      warning:
+        "SYNTHETIC DATA ONLY — MANUAL OPENING — GPT-5.6 COMPILATION GATED.",
+    },
+    {
+      id: "ncba-dpi-clinical",
+      applicationProfileId: "ncba-dpi",
+      name: "NCBA DPI — clinical runtime",
+      mode: "clinical",
+      defaultUrl: "https://dpi-ncba.gbna-sante.fr/",
+      urlEditable: true,
+      managedBrowserOnly: true,
+      compilationAllowed: false,
+      captureAllowed: false,
+      syntheticAttestationRequired: false,
+      warning: "CLINICAL RUNTIME — OPENAI ACCESS FORBIDDEN — EXECUTION ONLY.",
+    },
+  ].map((profile) => StudioApplicationProfileSchema.parse(profile));
+}
+
+export function resolveStudioProfileTarget(input: {
+  profileId: StudioProfileId;
+  targetUrl: string;
+  purpose: "open" | "capture" | "compile" | "run";
+  fixtureOrigin?: string;
+}) {
+  const profile = createStudioApplicationProfiles(input.fixtureOrigin).find(
+    (candidate) => candidate.id === input.profileId,
+  );
+  if (!profile) throw new Error("Unknown Studio application profile.");
+  if (input.purpose === "compile" && !profile.compilationAllowed) {
+    throw new Error("Compilation is technically disabled in clinical mode.");
+  }
+  if (input.purpose === "capture" && !profile.captureAllowed) {
+    throw new Error(
+      "Page-model capture is technically disabled in clinical mode.",
+    );
+  }
+  const fixtureOrigin = new URL(input.fixtureOrigin ?? profile.defaultUrl)
+    .origin;
+  const applicationProfile =
+    profile.applicationProfileId === "ncba-dpi-fixture"
+      ? ApplicationProfileSchema.parse({
+          ...localFixtureProfile,
+          trainingOrigins: [fixtureOrigin],
+          runtimeOrigins: [fixtureOrigin],
+        })
+      : ncbaDpiProfile;
+  const url = validateTargetUrl(input.targetUrl, {
+    mode: profile.mode,
+    profile: applicationProfile,
+    allowExplicitLocalFixture: profile.id === "ncba-dpi-fixture",
+  });
+  return { profile, applicationProfile, url };
+}
+
 const forbiddenProtocols = new Set([
   "file:",
   "data:",

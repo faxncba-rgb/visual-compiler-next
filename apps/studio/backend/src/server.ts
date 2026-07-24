@@ -1,17 +1,46 @@
 import express from "express";
+import { randomUUID } from "node:crypto";
 import { constants, existsSync } from "node:fs";
-import { access, chmod, mkdir, readdir, readFile, rm } from "node:fs/promises";
+import {
+  access,
+  chmod,
+  copyFile,
+  mkdir,
+  readdir,
+  readFile,
+  rm,
+} from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
-import { compileWorkflow } from "@visual-compiler/compiler";
+import { chromium, type BrowserContext } from "playwright";
+import {
+  compileWorkflow,
+  createRedactedCompilerPageModel,
+} from "@visual-compiler/compiler";
+import { extractPageModel, type PageModel } from "@visual-compiler/page-model";
 import { runCompiledWorkflow } from "@visual-compiler/runtime";
 import {
-  browserProfiles,
+  createStudioApplicationProfiles,
+  clinicalPreflight,
+  computeWorkflowHash,
+  createRedactedAudit,
+  createStructuralFingerprint,
   localFixtureProfile,
-  ncbaDpiProfile,
+  redactPageModel,
+  resolveStudioProfileTarget,
   requireValidAttestation,
-  validateTargetUrl,
+  StudioProfileIdSchema,
+  transitionWorkflow,
+  type PromotedWorkflow,
+  type RedactedPageModel,
+  type StructuralFingerprint,
+  type StudioProfileId,
+  type WorkflowState,
 } from "@visual-compiler/clinical-safety";
+import {
+  SemanticWorkflowSchema,
+  type SemanticWorkflow,
+} from "@visual-compiler/semantic-ir";
 import {
   DEFAULT_DEMO_INTERNAL_URL,
   DEFAULT_DEMO_PUBLIC_URL,
@@ -63,6 +92,32 @@ const publicDemoUrl = normalizedBaseUrl(
   DEFAULT_DEMO_PUBLIC_URL,
   "DEMO_SITE_PUBLIC_URL",
 );
+const studioProfiles = createStudioApplicationProfiles(publicDemoUrl);
+const managedContexts = new Map<StudioProfileId, BrowserContext>();
+const captures = new Map<
+  string,
+  {
+    id: string;
+    studioProfileId: StudioProfileId;
+    pageModel: PageModel;
+    redactedModel: RedactedPageModel;
+    fingerprint: StructuralFingerprint;
+    attestedAt: string;
+  }
+>();
+type LifecycleRecord = {
+  workflow: SemanticWorkflow;
+  state: WorkflowState;
+  captureId: string;
+  validation?: {
+    passed: boolean;
+    variants: Array<{ variant: "A" | "B"; passed: boolean }>;
+  };
+  approvalTimestamp?: string;
+  promotion?: PromotedWorkflow;
+  lastPreflight?: ReturnType<typeof clinicalPreflight>;
+};
+const lifecycleRecords = new Map<string, LifecycleRecord>();
 
 function escapeHtml(value: string) {
   return value
@@ -76,20 +131,133 @@ function demoUrl(baseUrl: string, variant: "A" | "B") {
   return `${baseUrl}/demo?variant=${variant}`;
 }
 
+function fixtureUrl(baseUrl: string, variant: "A" | "B", mode = "training") {
+  return `${baseUrl}/ncba-fixture?mode=${mode}&variant=${variant}`;
+}
+
+function redactCapturedPageModel(model: PageModel) {
+  return redactPageModel({
+    url: model.url,
+    nodes: model.nodes.map((node) => ({
+      tagName: node.tagName,
+      role: node.role,
+      label: node.attributes["data-vc-stable-label"],
+      text: node.text,
+      value: node.attributes.value,
+      selectedValue: node.attributes.selected,
+      checked: node.checked,
+      enabled: node.enabled,
+      visible: node.visible,
+      required: node.attributes.required !== undefined,
+      box: node.box,
+      attributes: node.attributes,
+    })),
+  });
+}
+
+async function captureLocalFixture(url: string) {
+  const browser = await chromium.launch({ headless: true });
+  const context = await browser.newContext({ serviceWorkers: "block" });
+  await context.route("**/*", async (route) => {
+    if (isOpenAIHost(new URL(route.request().url()).hostname)) {
+      await route.abort("blockedbyclient");
+      return;
+    }
+    await route.continue();
+  });
+  try {
+    const page = await context.newPage();
+    await page.goto(url);
+    return await extractPageModel(page);
+  } finally {
+    await context.close();
+    await browser.close();
+  }
+}
+
+function fixtureApplicationProfile() {
+  const origin = new URL(internalDemoUrl).origin;
+  return {
+    ...localFixtureProfile,
+    trainingOrigins: [origin],
+    runtimeOrigins: [origin],
+  };
+}
+
+function lifecycleSummary(record: LifecycleRecord) {
+  return {
+    workflowId: record.workflow.id,
+    workflowName: record.workflow.name,
+    state: record.state,
+    validation: record.validation,
+    approvalTimestamp: record.approvalTimestamp,
+    promotion: record.promotion
+      ? {
+          workflowSha256: record.promotion.workflowSha256,
+          promotionTimestamp: record.promotion.promotionTimestamp,
+          runtimeOpenAIPolicy: record.promotion.runtimeOpenAIPolicy,
+        }
+      : undefined,
+    preflight: record.lastPreflight,
+  };
+}
+
 async function ensureWorkflowStorage() {
   await mkdir(WORKFLOW_STORAGE_DIR, { recursive: true });
+  const seedPath = process.env.E2E_SEED_WORKFLOW_PATH;
+  if (seedPath && !existsSync(WORKFLOW_PATH)) {
+    await copyFile(path.resolve(seedPath), WORKFLOW_PATH);
+  }
   await access(WORKFLOW_STORAGE_DIR, constants.R_OK | constants.W_OK);
 }
 
-async function ensureBrowserProfileDirectory(mode: "training" | "clinical") {
+async function ensureBrowserProfileDirectory(profileId: StudioProfileId) {
   await mkdir(browserProfileRoot, { recursive: true, mode: 0o700 });
   await chmod(browserProfileRoot, 0o700);
-  const profileDirectory = path.join(
-    browserProfileRoot,
-    browserProfiles[mode].storageDirectoryName,
-  );
+  const profileDirectory = path.join(browserProfileRoot, profileId);
   await mkdir(profileDirectory, { recursive: true, mode: 0o700 });
   await chmod(profileDirectory, 0o700);
+  return profileDirectory;
+}
+
+function isOpenAIHost(hostname: string) {
+  const normalized = hostname.toLowerCase().replace(/\.$/, "");
+  return normalized === "openai.com" || normalized.endsWith(".openai.com");
+}
+
+async function openManagedBrowser(profileId: StudioProfileId, target: URL) {
+  const existing = managedContexts.get(profileId);
+  if (existing) {
+    const page = existing.pages()[0] ?? (await existing.newPage());
+    await page.goto(target.toString());
+    await page.bringToFront();
+    return;
+  }
+  const profileDirectory = await ensureBrowserProfileDirectory(profileId);
+  const context = await chromium.launchPersistentContext(profileDirectory, {
+    headless: false,
+    serviceWorkers: "block",
+    viewport: null,
+  });
+  managedContexts.set(profileId, context);
+  context.on("close", () => managedContexts.delete(profileId));
+  await context.route("**/*", async (route) => {
+    if (isOpenAIHost(new URL(route.request().url()).hostname)) {
+      await route.abort("blockedbyclient");
+      return;
+    }
+    await route.continue();
+  });
+  await context.routeWebSocket(
+    (url) => isOpenAIHost(url.hostname),
+    (webSocket) =>
+      webSocket.close({
+        code: 1008,
+        reason: "OpenAI network access is forbidden in managed browsers.",
+      }),
+  );
+  const page = context.pages()[0] ?? (await context.newPage());
+  await page.goto(target.toString());
 }
 
 function workflowArtifactPath(workflowId: string) {
@@ -134,6 +302,10 @@ function studioHtml() {
     "<",
     "\\u003c",
   );
+  const serializedStudioProfiles = JSON.stringify(studioProfiles).replaceAll(
+    "<",
+    "\\u003c",
+  );
   return `<!doctype html>
 <html lang="en">
 <head>
@@ -155,6 +327,7 @@ function studioHtml() {
     .hint { color: #9facbf; font-size: 13px; line-height: 1.4; margin: 10px 0 0; }
     textarea { display: block; width: 100%; min-height: 156px; resize: vertical; border: 1px solid #3b4555; background: #171b22; color: #f5f7fb; border-radius: 7px; padding: 12px; font: inherit; font-size: 16px; line-height: 1.4; }
     button, select { min-height: 44px; border: 1px solid #3c4858; background: #1d2430; color: #f3f6fb; border-radius: 7px; padding: 10px 12px; font: inherit; font-weight: 700; touch-action: manipulation; }
+    button, select, input, textarea { max-width: 100%; min-width: 0; }
     button { cursor: pointer; }
     button:focus-visible, select:focus-visible, textarea:focus-visible { outline: 3px solid #65bff3; outline-offset: 2px; }
     button.primary { background: #2f8f68; border-color: #2f8f68; }
@@ -174,8 +347,20 @@ function studioHtml() {
     .mode-panel { border: 2px solid #d4a832; border-radius: 9px; padding: 14px; margin: 16px 0; background: #272315; }
     .mode-panel.clinical { border-color: #d75252; background: #2b181b; }
     .mode-title { font-weight: 900; letter-spacing: .08em; }
+    .profile-status { display: grid; grid-template-columns: 1fr auto; gap: 8px; margin: 10px 0; padding: 10px; border-radius: 7px; background: #141820; }
+    .profile-status strong { color: #fff; }
+    .field { display: grid; gap: 6px; margin-top: 10px; }
+    .field select, .field input { width: 100%; }
+    .hidden { display: none !important; }
     .attestation { display: grid; gap: 8px; margin-top: 12px; font-size: 13px; }
     .attestation label { display: grid; grid-template-columns: 22px 1fr; gap: 6px; align-items: start; }
+    .lifecycle-track { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 6px; margin: 14px 0; }
+    .lifecycle-track span { min-width: 0; padding: 8px 4px; border: 1px solid #4a5361; border-radius: 6px; color: #9facbf; font-size: 12px; text-align: center; overflow-wrap: anywhere; }
+    .lifecycle-track span.complete { border-color: #2f8f68; background: #183527; color: #9df1c4; }
+    .lifecycle-track span.active { border-color: #65bff3; background: #183246; color: #fff; box-shadow: 0 0 0 2px rgba(101,191,243,.2); }
+    .report-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; margin: 14px 0; }
+    .report-grid > div { min-width: 0; }
+    .report-grid pre { margin-top: 6px; max-height: 220px; }
     input[type="url"] { width: 100%; min-height: 44px; border: 1px solid #3b4555; background: #171b22; color: white; border-radius: 7px; padding: 10px; font-size: 16px; }
     @media (max-width: 980px) {
       .app { grid-template-columns: 1fr; min-height: auto; }
@@ -186,6 +371,7 @@ function studioHtml() {
       .preview { height: 68svh; min-height: 460px; }
       iframe { min-height: 460px; }
       pre { max-height: 60svh; }
+      .report-grid { grid-template-columns: 1fr; }
     }
     @media (max-width: 520px) {
       .left, .right { padding-top: 16px; padding-bottom: 16px; }
@@ -206,37 +392,90 @@ function studioHtml() {
     <aside class="left">
       <h1>Visual Compiler</h1>
       <p class="tagline">Compile on synthetic data. Execute on real workflows.</p>
-      <section class="mode-panel" aria-label="Training Compilation">
-        <div class="mode-title">TRAINING MODE</div>
-        <strong>SYNTHETIC DATA ONLY</strong><br><strong>GPT-5.6 COMPILATION ENABLED</strong>
-        <label for="targetUrl">Target Website URL</label>
-        <input id="targetUrl" type="url" value="http://127.0.0.1:4173/ncba-fixture?mode=training&amp;variant=A">
-        <div class="attestation" aria-label="Synthetic data attestation">
+      <section class="mode-panel" id="activeProfilePanel" aria-label="Active application profile">
+        <div class="mode-title">APPLICATION PROFILE</div>
+        <label class="field" for="applicationProfile">Managed profile
+          <select id="applicationProfile" aria-label="Application profile"></select>
+        </label>
+        <div class="profile-status" aria-live="polite">
+          <span>Active profile</span><strong id="activeProfileId">ncba-dpi-fixture</strong>
+          <span>Active mode</span><strong id="activeMode">TRAINING</strong>
+        </div>
+        <strong id="profileWarning">SYNTHETIC DATA ONLY — LOCAL FIXTURE.</strong>
+        <label class="field" id="targetUrlField" for="targetUrl">Target Website URL
+          <input id="targetUrl" type="url" autocomplete="off">
+        </label>
+        <button type="button" id="openManagedBrowser">Open in managed browser</button>
+        <p class="hint" id="openPolicy">Selecting a profile never opens its URL. Opening requires this explicit action.</p>
+        <div class="attestation" id="syntheticAttestation" aria-label="Synthetic data attestation">
           <strong>I confirm that:</strong>
-          <label><input type="checkbox"> <span>I am authorized to automate this training environment.</span></label>
-          <label><input type="checkbox"> <span>This browser session contains synthetic data only.</span></label>
-          <label><input type="checkbox"> <span>No real patient data is visible.</span></label>
-          <label><input type="checkbox"> <span>No credential or secret may be sent to OpenAI.</span></label>
-          <label><input type="checkbox"> <span>The workflow is administrative and reversible.</span></label>
+          <label><input type="checkbox" data-attestation-key="authorizedTrainingEnvironment"> <span>I am authorized to automate this training environment.</span></label>
+          <label><input type="checkbox" data-attestation-key="syntheticDataOnly"> <span>Synthetic environment — no patient data.</span></label>
+          <label><input type="checkbox" data-attestation-key="noRealPatientDataVisible"> <span>No real patient data is visible.</span></label>
+          <label><input type="checkbox" data-attestation-key="noCredentialOrSecretSentToOpenAI"> <span>No credential, cookie, token, form value, browser storage, or network data may be sent to OpenAI.</span></label>
+          <label><input type="checkbox" data-attestation-key="administrativeAndReversible"> <span>The workflow is administrative and reversible.</span></label>
+          <label><input type="checkbox" id="indicatorVerified"> <span>I verified the synthetic marker locally.</span></label>
+          <label class="field" for="syntheticIndicator">Verified marker
+            <select id="syntheticIndicator">
+              <option value="training-banner">Training banner</option>
+              <option value="demo-account">Demo account</option>
+              <option value="test-tenant">Test tenant</option>
+              <option value="test-record">TEST record</option>
+              <option value="institution-approved-marker">Institution-approved marker</option>
+            </select>
+          </label>
         </div>
       </section>
-      <h2>Instruction</h2>
-      <textarea id="instruction" aria-label="Workflow instruction">${escapeHtml(DEFAULT_INSTRUCTION)}</textarea>
-      <div class="row">
-        <select id="workflow" aria-label="Compiled workflow"></select>
-        <select id="variant" aria-label="Demo layout"><option value="A">Variant A</option><option value="B">Variant B</option></select>
-        <button class="primary" id="compile">Compile</button>
-        <button class="secondary" id="runA">Run A</button>
-        <button class="secondary" id="runB">Run B</button>
-      </div>
-      <p class="hint">Run A/B opens a separate visible Chromium replay. The iframe remains an independent preview.</p>
-      <section class="mode-panel clinical" aria-label="Clinical Runtime">
+      <section id="trainingControls" aria-label="Training Compilation">
+        <h2>Instruction</h2>
+        <textarea id="instruction" aria-label="Workflow instruction">${escapeHtml(DEFAULT_INSTRUCTION)}</textarea>
+        <div class="row">
+          <select id="workflow" aria-label="Compiled workflow"></select>
+          <select id="variant" aria-label="Demo layout"><option value="A">Variant A</option><option value="B">Variant B</option></select>
+          <button class="secondary" id="capture">Capture</button>
+          <button class="primary" id="compile" disabled>Compile</button>
+          <button class="secondary" id="runA">Run A</button>
+          <button class="secondary" id="runB">Run B</button>
+        </div>
+        <p class="hint">Capture and compilation remain closed until every attestation control is checked. Run A/B replays only the local Build Week fixture.</p>
+      </section>
+      <section class="mode-panel" id="fixtureLifecyclePanel" aria-label="Fixture workflow lifecycle">
+        <div class="mode-title">FIXTURE WORKFLOW JOURNEY</div>
+        <div class="lifecycle-track" aria-label="Workflow lifecycle">
+          <span data-lifecycle-state="Draft">Draft</span>
+          <span data-lifecycle-state="Validated">Validated</span>
+          <span data-lifecycle-state="Approved">Approved</span>
+          <span data-lifecycle-state="Promoted">Promoted</span>
+          <span data-lifecycle-state="Revoked">Revoked</span>
+        </div>
+        <div class="row">
+          <button type="button" id="validateWorkflow" disabled>Validate A/B</button>
+          <label><input type="checkbox" id="approvalConfirmation"> Human approval confirmed</label>
+          <button type="button" id="approveWorkflow" disabled>Approve</button>
+          <button type="button" id="promoteWorkflow" disabled>Promote</button>
+          <button type="button" id="revokeWorkflow" disabled>Revoke</button>
+        </div>
+        <div class="report-grid">
+          <div><strong>Redaction report</strong><pre id="redactionReport">Capture required.</pre></div>
+          <div><strong>Structural fingerprint</strong><pre id="fingerprintReport">Capture required.</pre></div>
+          <div><strong>Preflight result</strong><pre id="preflightReport">Promotion required.</pre></div>
+        </div>
+        <label><input type="checkbox" id="preflightConfirmation"> I reviewed the planned actions and confirm preflight.</label>
+        <div class="row">
+          <button type="button" id="fixturePreflight" disabled>Run preflight</button>
+          <button type="button" id="runPromotedA" disabled>Execute promoted A</button>
+          <button type="button" id="runPromotedB" disabled>Execute promoted B</button>
+        </div>
+        <pre id="fixtureRuntimeResult">Runtime LLM calls: 0
+OpenAI requests: 0</pre>
+      </section>
+      <section class="mode-panel clinical hidden" id="clinicalPanel" aria-label="Clinical Runtime">
         <div class="mode-title">CLINICAL RUNTIME</div>
         <strong>OPENAI ACCESS FORBIDDEN</strong><br><strong>PROMOTED WORKFLOWS ONLY</strong>
         <label for="promotedWorkflow">Promoted workflow</label>
         <select id="promotedWorkflow" aria-label="Promoted workflow"><option>No promoted NCBA workflow</option></select>
-        <p class="hint">Hash verification: pending<br>Structural compatibility: pending<br>Runtime LLM calls: 0<br>OpenAI requests: 0</p>
-        <pre aria-label="Planned clinical actions">No actions — preflight required.</pre>
+        <p class="hint" id="clinicalMetrics">Hash verification: pending<br>Structural compatibility: pending<br>Runtime LLM calls: 0<br>OpenAI requests: 0</p>
+        <pre id="clinicalPreflightResult" aria-label="Planned clinical actions">No actions — preflight required.</pre>
         <label><input type="checkbox" id="clinicalConfirmation"> I reviewed the planned reversible administrative actions.</label>
         <button type="button" id="clinicalPreflight">Preflight</button>
         <button type="button" id="clinicalRun" disabled>Run promoted workflow</button>
@@ -268,13 +507,140 @@ function studioHtml() {
   </main>
   <script>
     const publicDemoUrl = ${serializedPublicDemoUrl};
-    const state = { workflow: null, telemetry: null, tab: "ir" };
+    const studioProfiles = ${serializedStudioProfiles};
+    const state = {
+      workflow: null,
+      telemetry: null,
+      tab: "ir",
+      profile: studioProfiles[0],
+      capture: null,
+      lifecycle: null,
+      preflight: null
+    };
     const output = document.getElementById("output");
     const workflowSelect = document.getElementById("workflow");
-    const controls = Array.from(document.querySelectorAll("#workflow, #variant, #compile, #runA, #runB"));
+    const profileSelect = document.getElementById("applicationProfile");
+    const targetUrl = document.getElementById("targetUrl");
+    const compileButton = document.getElementById("compile");
+    const captureButton = document.getElementById("capture");
+    const attestationInputs = Array.from(document.querySelectorAll("[data-attestation-key]"));
+    const indicatorVerified = document.getElementById("indicatorVerified");
+    const controls = Array.from(document.querySelectorAll("button, select, input, textarea"));
     const variantUrl = variant => publicDemoUrl + "/demo?variant=" + variant;
-    const setBusy = busy => controls.forEach(button => { button.disabled = busy; });
+    const lifecycleOrder = ["Draft", "Validated", "Approved", "Promoted", "Revoked"];
+    const attestationComplete = () =>
+      attestationInputs.every(input => input.checked) && indicatorVerified.checked;
+    const syncJourneyControls = () => {
+      const fixture = state.profile.id === "ncba-dpi-fixture";
+      const attested = attestationComplete();
+      const lifecycleState = state.lifecycle?.state;
+      captureButton.disabled =
+        state.profile.mode === "clinical" ||
+        !state.profile.captureAllowed ||
+        !attested;
+      compileButton.disabled =
+        state.profile.mode === "clinical" ||
+        !state.profile.compilationAllowed ||
+        !attested ||
+        !state.capture;
+      document.getElementById("runA").disabled = !fixture;
+      document.getElementById("runB").disabled = !fixture;
+      document.getElementById("validateWorkflow").disabled = !fixture || lifecycleState !== "Draft";
+      document.getElementById("approveWorkflow").disabled =
+        !fixture ||
+        lifecycleState !== "Validated" ||
+        !document.getElementById("approvalConfirmation").checked;
+      document.getElementById("promoteWorkflow").disabled = !fixture || lifecycleState !== "Approved";
+      document.getElementById("revokeWorkflow").disabled = !fixture || lifecycleState !== "Promoted";
+      document.getElementById("fixturePreflight").disabled =
+        !fixture ||
+        lifecycleState !== "Promoted" ||
+        !document.getElementById("preflightConfirmation").checked;
+      document.getElementById("runPromotedA").disabled =
+        !fixture || lifecycleState !== "Promoted" || !state.preflight?.allowed;
+      document.getElementById("runPromotedB").disabled =
+        !fixture || lifecycleState !== "Promoted" || !state.preflight?.allowed;
+      document.getElementById("clinicalPreflight").disabled =
+        state.profile.mode !== "clinical" ||
+        !state.lifecycle?.promotion ||
+        !document.getElementById("clinicalConfirmation").checked;
+      document.getElementById("clinicalRun").disabled =
+        state.profile.mode !== "clinical" ||
+        state.lifecycle?.state !== "Promoted" ||
+        !state.preflight?.allowed;
+    };
+    const setBusy = busy => {
+      controls.forEach(control => { control.disabled = busy; });
+      if (!busy) syncJourneyControls();
+    };
     const setStatus = (text, cls = "warn") => { const el = document.getElementById("status"); el.textContent = text; el.className = cls; };
+    const syntheticAttestation = () => ({
+      profileId: state.profile.applicationProfileId,
+      statements: Object.fromEntries(
+        attestationInputs.map(input => [input.dataset.attestationKey, input.checked])
+      ),
+      syntheticIndicator: document.getElementById("syntheticIndicator").value,
+      indicatorVerifiedLocally: indicatorVerified.checked,
+      attestedAt: new Date().toISOString()
+    });
+    const resetAttestation = () => {
+      attestationInputs.forEach(input => { input.checked = false; });
+      indicatorVerified.checked = false;
+      syncJourneyControls();
+    };
+    const resetCapture = () => {
+      state.capture = null;
+      document.getElementById("redactionReport").textContent = "Capture required.";
+      document.getElementById("fingerprintReport").textContent = "Capture required.";
+      syncJourneyControls();
+    };
+    const renderLifecycle = () => {
+      const current = state.lifecycle?.state;
+      const currentIndex = lifecycleOrder.indexOf(current);
+      document.querySelectorAll("[data-lifecycle-state]").forEach(node => {
+        const index = lifecycleOrder.indexOf(node.dataset.lifecycleState);
+        node.classList.toggle("active", node.dataset.lifecycleState === current);
+        node.classList.toggle("complete", currentIndex >= 0 && index < currentIndex);
+      });
+      const promotedSelect = document.getElementById("promotedWorkflow");
+      if (state.lifecycle?.promotion && state.workflow) {
+        const option = document.createElement("option");
+        option.value = state.workflow.id;
+        option.textContent = state.workflow.name + " — " + state.lifecycle.state;
+        promotedSelect.replaceChildren(option);
+      } else {
+        const option = document.createElement("option");
+        option.textContent = "No promoted NCBA workflow";
+        promotedSelect.replaceChildren(option);
+      }
+      syncJourneyControls();
+    };
+    const renderProfile = profile => {
+      state.profile = profile;
+      document.getElementById("activeProfileId").textContent = profile.id;
+      document.getElementById("activeMode").textContent =
+        profile.id === "ncba-dpi-fixture" ? "FIXTURE" : profile.mode.toUpperCase();
+      document.getElementById("profileWarning").textContent = profile.warning;
+      targetUrl.value = profile.defaultUrl;
+      targetUrl.readOnly = !profile.urlEditable;
+      document.getElementById("syntheticAttestation").classList.toggle("hidden", !profile.syntheticAttestationRequired);
+      document.getElementById("trainingControls").classList.toggle("hidden", profile.mode === "clinical");
+      document.getElementById("fixtureLifecyclePanel").classList.toggle("hidden", profile.id !== "ncba-dpi-fixture");
+      document.getElementById("clinicalPanel").classList.toggle("hidden", profile.mode !== "clinical");
+      document.getElementById("activeProfilePanel").classList.toggle("clinical", profile.mode === "clinical");
+      resetAttestation();
+      resetCapture();
+      const frame = document.getElementById("demo");
+      if (profile.id === "ncba-dpi-fixture") {
+        frame.removeAttribute("srcdoc");
+        frame.src = profile.defaultUrl;
+      } else {
+        frame.removeAttribute("src");
+        frame.srcdoc = "<!doctype html><title>Manual opening required</title><style>body{font:16px system-ui;padding:32px;color:#18202b}strong{display:block;margin-bottom:12px}</style><strong>Manual opening required</strong><p>Studio will not contact this profile URL automatically. Use Open in managed browser after verifying authorization and mode.</p>";
+      }
+      setStatus(profile.mode === "clinical" ? "Clinical execution-only profile" : "Training profile selected");
+      renderLifecycle();
+    };
     const showWorkflowMetrics = workflow => {
       document.getElementById("compileCalls").textContent = workflow.diagnostics.modelCalls;
       document.getElementById("compileModel").textContent = workflow.diagnostics.responseModel ?? workflow.compileModel;
@@ -327,16 +693,61 @@ function studioHtml() {
       return json;
     };
     document.querySelectorAll("[data-tab]").forEach(btn => btn.addEventListener("click", () => { state.tab = btn.dataset.tab; render(); }));
-    document.getElementById("variant").addEventListener("change", event => { document.getElementById("demo").src = variantUrl(event.target.value); });
+    document.getElementById("variant").addEventListener("change", event => {
+      if (state.profile.id === "ncba-dpi-fixture") {
+        document.getElementById("demo").src = variantUrl(event.target.value);
+      }
+    });
+    document.getElementById("capture").addEventListener("click", async () => {
+      setBusy(true);
+      setStatus("Capturing redacted page model");
+      try {
+        const json = await requestJson("/api/capture", {
+          studioProfileId: state.profile.id,
+          targetUrl: targetUrl.value,
+          syntheticAttestation: syntheticAttestation()
+        });
+        state.capture = json;
+        document.getElementById("redactionReport").textContent = JSON.stringify({
+          ...json.redactionReport,
+          cookiesCaptured: false,
+          storageCaptured: false,
+          networkCaptured: false,
+          capturedValuesReturned: json.capturedValuesReturned
+        }, null, 2);
+        document.getElementById("fingerprintReport").textContent = JSON.stringify({
+          version: json.structuralFingerprint.version,
+          sha256: json.structuralFingerprint.sha256,
+          requiredElements: json.structuralFingerprint.requiredElements
+        }, null, 2);
+        setStatus("Redacted capture ready", "ok");
+      } catch (error) {
+        state.capture = null;
+        setStatus("Capture failed", "error");
+        output.textContent = JSON.stringify(error.response ?? { error: error.message }, null, 2);
+      } finally {
+        setBusy(false);
+      }
+    });
     document.getElementById("compile").addEventListener("click", async () => {
       setBusy(true);
       setStatus("Compiling");
       try {
         const variant = document.getElementById("variant").value;
-        const json = await requestJson("/api/compile", { instruction: document.getElementById("instruction").value, variant });
+        const json = await requestJson("/api/compile", {
+          instruction: document.getElementById("instruction").value,
+          variant,
+          studioProfileId: state.profile.id,
+          targetUrl: targetUrl.value,
+          captureId: state.capture?.captureId,
+          syntheticAttestation: syntheticAttestation()
+        });
         await refreshWorkflowList(json.workflow.id);
         applyWorkflow(json.workflow);
-        setStatus("Compiled", "ok");
+        state.lifecycle = json.lifecycle;
+        state.preflight = null;
+        renderLifecycle();
+        setStatus("Compiled — Draft", "ok");
       } catch (error) {
         setStatus("Failed", "error");
         output.textContent = JSON.stringify(error.response ?? { error: error.message }, null, 2);
@@ -364,12 +775,176 @@ function studioHtml() {
     }
     document.getElementById("runA").addEventListener("click", () => run("A"));
     document.getElementById("runB").addEventListener("click", () => run("B"));
+    const lifecycleRequest = async (action, body = {}) => {
+      if (!state.workflow) throw new Error("Compile a fixture workflow first.");
+      const json = await requestJson(
+        "/api/workflows/" + encodeURIComponent(state.workflow.id) + "/" + action,
+        body
+      );
+      if (json.lifecycle) state.lifecycle = json.lifecycle;
+      renderLifecycle();
+      return json;
+    };
+    document.getElementById("validateWorkflow").addEventListener("click", async () => {
+      setBusy(true);
+      setStatus("Validating variants A and B");
+      try {
+        const json = await lifecycleRequest("validate");
+        state.telemetry = json.lifecycle.validation;
+        setStatus("Workflow Validated on A/B", "ok");
+      } catch (error) {
+        setStatus("Validation failed", "error");
+        output.textContent = JSON.stringify(error.response ?? { error: error.message }, null, 2);
+      } finally {
+        setBusy(false);
+      }
+    });
+    document.getElementById("approveWorkflow").addEventListener("click", async () => {
+      setBusy(true);
+      try {
+        await lifecycleRequest("approve", {
+          confirmed: document.getElementById("approvalConfirmation").checked
+        });
+        setStatus("Workflow Approved", "ok");
+      } catch (error) {
+        setStatus("Approval failed", "error");
+        output.textContent = JSON.stringify(error.response ?? { error: error.message }, null, 2);
+      } finally {
+        setBusy(false);
+      }
+    });
+    document.getElementById("promoteWorkflow").addEventListener("click", async () => {
+      setBusy(true);
+      try {
+        const json = await lifecycleRequest("promote");
+        document.getElementById("preflightReport").textContent = JSON.stringify({
+          status: "Promotion complete — preflight required",
+          workflowSha256: json.lifecycle.promotion.workflowSha256,
+          runtimeOpenAIPolicy: json.lifecycle.promotion.runtimeOpenAIPolicy
+        }, null, 2);
+        setStatus("Workflow Promoted", "ok");
+      } catch (error) {
+        setStatus("Promotion failed", "error");
+        output.textContent = JSON.stringify(error.response ?? { error: error.message }, null, 2);
+      } finally {
+        setBusy(false);
+      }
+    });
+    document.getElementById("revokeWorkflow").addEventListener("click", async () => {
+      setBusy(true);
+      try {
+        await lifecycleRequest("revoke");
+        state.preflight = null;
+        setStatus("Workflow Revoked", "warn");
+      } catch (error) {
+        setStatus("Revocation failed", "error");
+        output.textContent = JSON.stringify(error.response ?? { error: error.message }, null, 2);
+      } finally {
+        setBusy(false);
+      }
+    });
+    const runPreflight = async clinical => {
+      setBusy(true);
+      setStatus("Running local structural preflight");
+      try {
+        const confirmed = clinical
+          ? document.getElementById("clinicalConfirmation").checked
+          : document.getElementById("preflightConfirmation").checked;
+        const json = await lifecycleRequest("preflight", { confirmed });
+        state.preflight = json.preflight;
+        const report = {
+          ...json.preflight,
+          plannedActions: json.plannedActions,
+          llmCalls: json.llmCalls,
+          openAIRequests: json.openAIRequests
+        };
+        document.getElementById("preflightReport").textContent = JSON.stringify(report, null, 2);
+        document.getElementById("clinicalPreflightResult").textContent = JSON.stringify(report, null, 2);
+        document.getElementById("clinicalMetrics").innerHTML =
+          "Hash verification: passed<br>Structural compatibility: " +
+          Math.round(json.preflight.structuralCompatibility * 100) +
+          "%<br>Runtime LLM calls: 0<br>OpenAI requests: 0";
+        setStatus("Preflight passed", "ok");
+      } catch (error) {
+        state.preflight = null;
+        setStatus("Preflight rejected", "error");
+        const report = error.response ?? { error: error.message };
+        document.getElementById("preflightReport").textContent = JSON.stringify(report, null, 2);
+        document.getElementById("clinicalPreflightResult").textContent = JSON.stringify(report, null, 2);
+      } finally {
+        setBusy(false);
+      }
+    };
+    document.getElementById("fixturePreflight").addEventListener("click", () => runPreflight(false));
+    const runPromoted = async variant => {
+      setBusy(true);
+      setStatus("Executing promoted workflow locally");
+      try {
+        const json = await lifecycleRequest("run-promoted", { variant });
+        state.telemetry = json.telemetry;
+        document.getElementById("runtimeCalls").textContent = String(json.llmCalls);
+        document.getElementById("fixtureRuntimeResult").textContent = JSON.stringify({
+          workflowApproved: json.workflowApproved,
+          structuralCompatibility: json.structuralCompatibility,
+          stepResults: json.telemetry.steps.map(step => ({
+            stepId: step.stepId,
+            action: step.action,
+            status: step.status
+          })),
+          runtimeLlmCalls: json.llmCalls,
+          openAIRequests: json.openAIRequests,
+          audit: json.audit
+        }, null, 2);
+        setStatus("Promoted workflow passed on variant " + variant, "ok");
+      } catch (error) {
+        setStatus("Promoted execution failed", "error");
+        document.getElementById("fixtureRuntimeResult").textContent =
+          JSON.stringify(error.response ?? { error: error.message }, null, 2);
+      } finally {
+        setBusy(false);
+      }
+    };
+    document.getElementById("runPromotedA").addEventListener("click", () => runPromoted("A"));
+    document.getElementById("runPromotedB").addEventListener("click", () => runPromoted("B"));
+    document.getElementById("openManagedBrowser").addEventListener("click", async () => {
+      if (
+        state.profile.managedBrowserOnly &&
+        !window.confirm("This explicit action will contact only the configured profile origin in a visible managed browser. Continue?")
+      ) return;
+      setBusy(true);
+      setStatus("Opening managed browser");
+      try {
+        const result = await requestJson("/api/managed-browser/open", {
+          studioProfileId: state.profile.id,
+          targetUrl: targetUrl.value,
+          explicitUserAction: true
+        });
+        setStatus(result.status, "ok");
+      } catch (error) {
+        setStatus("Managed browser opening failed", "error");
+        output.textContent = JSON.stringify(error.response ?? { error: error.message }, null, 2);
+      } finally {
+        setBusy(false);
+      }
+    });
+    [...attestationInputs, indicatorVerified].forEach(input => {
+      input.addEventListener("change", syncJourneyControls);
+    });
+    document.getElementById("approvalConfirmation").addEventListener("change", syncJourneyControls);
+    document.getElementById("preflightConfirmation").addEventListener("change", syncJourneyControls);
+    document.getElementById("clinicalConfirmation").addEventListener("change", syncJourneyControls);
+    profileSelect.addEventListener("change", () => {
+      const profile = studioProfiles.find(candidate => candidate.id === profileSelect.value);
+      if (profile) renderProfile(profile);
+    });
     document.getElementById("clinicalStop").addEventListener("click", () => {
       setStatus("Clinical run stopped", "warn");
     });
+    document.getElementById("clinicalPreflight").addEventListener("click", () => runPreflight(true));
+    document.getElementById("clinicalRun").addEventListener("click", () => runPromoted("A"));
     document.getElementById("deleteClinicalProfile").addEventListener("click", async () => {
       if (!window.confirm("Delete the independent local clinical browser profile?")) return;
-      const response = await fetch("/api/browser-profiles/clinical", { method: "DELETE" });
+      const response = await fetch("/api/browser-profiles/" + encodeURIComponent(state.profile.id), { method: "DELETE" });
       const result = await response.json();
       setStatus(response.ok ? result.status : result.error, response.ok ? "ok" : "error");
     });
@@ -379,6 +954,15 @@ function studioHtml() {
         output.textContent = JSON.stringify({ error: error.message }, null, 2);
       });
     });
+    profileSelect.replaceChildren(
+      ...studioProfiles.map(profile => {
+        const option = document.createElement("option");
+        option.value = profile.id;
+        option.textContent = profile.id + " — " + profile.name;
+        return option;
+      })
+    );
+    renderProfile(studioProfiles[0]);
     render();
     refreshWorkflowList(${JSON.stringify(defaultWorkflowId)})
       .then(loadWorkflow)
@@ -429,35 +1013,67 @@ app.get("/health", async (_req, res) => {
   }
 });
 app.get("/api/application-profiles", (_req, res) => {
-  res.json({
-    profiles: [localFixtureProfile, ncbaDpiProfile],
-    browserProfiles,
-  });
+  res.json({ profiles: studioProfiles });
 });
-app.delete("/api/browser-profiles/:mode", async (req, res) => {
-  const mode = req.params.mode;
-  if (mode !== "training" && mode !== "clinical") {
-    res.status(400).json({ error: "Unknown browser profile mode." });
+app.post("/api/managed-browser/open", async (req, res) => {
+  if (req.body.explicitUserAction !== true) {
+    res.status(400).json({
+      error: "Opening a managed browser requires an explicit user action.",
+    });
     return;
   }
-  const profileDirectory = path.join(
-    browserProfileRoot,
-    browserProfiles[mode].storageDirectoryName,
+  const parsedProfileId = StudioProfileIdSchema.safeParse(
+    req.body.studioProfileId,
   );
-  await rm(profileDirectory, { recursive: true, force: true });
-  res.json({ status: `${mode} browser profile deleted` });
-});
-app.post("/api/browser-profiles/:mode/prepare", async (req, res) => {
-  const mode = req.params.mode;
-  if (mode !== "training" && mode !== "clinical") {
-    res.status(400).json({ error: "Unknown browser profile mode." });
+  if (!parsedProfileId.success) {
+    res.status(400).json({ error: "Unknown Studio application profile." });
     return;
   }
-  await ensureBrowserProfileDirectory(mode);
+  try {
+    const resolved = resolveStudioProfileTarget({
+      profileId: parsedProfileId.data,
+      targetUrl: String(req.body.targetUrl ?? ""),
+      purpose: "open",
+      fixtureOrigin: publicDemoUrl,
+    });
+    await openManagedBrowser(parsedProfileId.data, resolved.url);
+    res.json({
+      status: "Managed browser opened by explicit user action",
+      profileId: resolved.profile.id,
+      mode: resolved.profile.mode,
+    });
+  } catch (error) {
+    res
+      .status(400)
+      .json({ error: error instanceof Error ? error.message : String(error) });
+  }
+});
+app.delete("/api/browser-profiles/:profileId", async (req, res) => {
+  const parsedProfileId = StudioProfileIdSchema.safeParse(req.params.profileId);
+  if (!parsedProfileId.success) {
+    res.status(400).json({ error: "Unknown Studio application profile." });
+    return;
+  }
+  await managedContexts.get(parsedProfileId.data)?.close();
+  managedContexts.delete(parsedProfileId.data);
+  const profileDirectory = path.join(browserProfileRoot, parsedProfileId.data);
+  await rm(profileDirectory, { recursive: true, force: true });
+  res.json({ status: `${parsedProfileId.data} browser profile deleted` });
+});
+app.post("/api/browser-profiles/:profileId/prepare", async (req, res) => {
+  const parsedProfileId = StudioProfileIdSchema.safeParse(req.params.profileId);
+  if (!parsedProfileId.success) {
+    res.status(400).json({ error: "Unknown Studio application profile." });
+    return;
+  }
+  const profile = studioProfiles.find(
+    (candidate) => candidate.id === parsedProfileId.data,
+  )!;
+  await ensureBrowserProfileDirectory(parsedProfileId.data);
   res.json({
-    status: `${mode} browser profile prepared`,
+    status: `${profile.id} browser profile prepared`,
     permissions: "0700",
-    compilationAllowed: browserProfiles[mode].compilationAllowed,
+    compilationAllowed: profile.compilationAllowed,
   });
 });
 app.post("/api/clinical/compile", (_req, res) => {
@@ -465,21 +1081,147 @@ app.post("/api/clinical/compile", (_req, res) => {
     .status(403)
     .json({ error: "Compilation is technically disabled in clinical mode." });
 });
-app.post("/api/compile", async (req, res) => {
+app.post("/api/capture", async (req, res) => {
+  const parsedProfileId = StudioProfileIdSchema.safeParse(
+    req.body.studioProfileId,
+  );
+  if (!parsedProfileId.success) {
+    res.status(400).json({ error: "A valid Studio profile is required." });
+    return;
+  }
+  const studioProfile = studioProfiles.find(
+    (candidate) => candidate.id === parsedProfileId.data,
+  )!;
+  if (!studioProfile.captureAllowed) {
+    res
+      .status(403)
+      .json({ error: "Page-model capture is disabled in clinical mode." });
+    return;
+  }
+  let resolved: ReturnType<typeof resolveStudioProfileTarget>;
   try {
-    if (req.body.mode === "clinical") {
-      res.status(403).json({
-        error: "Compilation is technically disabled in clinical mode.",
+    resolved = resolveStudioProfileTarget({
+      profileId: parsedProfileId.data,
+      targetUrl: String(req.body.targetUrl ?? ""),
+      purpose: "capture",
+      fixtureOrigin: publicDemoUrl,
+    });
+  } catch (error) {
+    res
+      .status(400)
+      .json({ error: error instanceof Error ? error.message : String(error) });
+    return;
+  }
+  let attestation;
+  try {
+    attestation = requireValidAttestation(
+      req.body.syntheticAttestation,
+      resolved.applicationProfile,
+    );
+  } catch {
+    res.status(403).json({
+      error:
+        "Capture closed: complete fresh synthetic-environment attestation is required.",
+    });
+    return;
+  }
+  try {
+    let pageModel: PageModel;
+    if (studioProfile.managedBrowserOnly) {
+      const page = managedContexts.get(studioProfile.id)?.pages()[0];
+      if (!page) {
+        res.status(409).json({
+          error:
+            "Open this training profile manually in its managed browser before capture.",
+        });
+        return;
+      }
+      resolveStudioProfileTarget({
+        profileId: studioProfile.id,
+        targetUrl: page.url(),
+        purpose: "capture",
+        fixtureOrigin: publicDemoUrl,
       });
-      return;
+      pageModel = await extractPageModel(page);
+    } else {
+      const internalTarget = new URL(
+        `${resolved.url.pathname}${resolved.url.search}`,
+        internalDemoUrl,
+      );
+      pageModel = await captureLocalFixture(internalTarget.toString());
     }
-    if (req.body.applicationProfileId === "ncba-dpi") {
-      requireValidAttestation(req.body.syntheticAttestation, ncbaDpiProfile);
-      validateTargetUrl(String(req.body.targetUrl ?? ""), {
-        mode: "training",
-        profile: ncbaDpiProfile,
-      });
-    }
+    const redactedModel = redactCapturedPageModel(pageModel);
+    const fingerprint = createStructuralFingerprint(redactedModel);
+    const id = randomUUID();
+    captures.set(id, {
+      id,
+      studioProfileId: studioProfile.id,
+      pageModel,
+      redactedModel,
+      fingerprint,
+      attestedAt: attestation.attestedAt,
+    });
+    const compilerBoundary = createRedactedCompilerPageModel(pageModel);
+    res.json({
+      captureId: id,
+      profileId: studioProfile.id,
+      redactionReport: redactedModel.report,
+      compilerBoundaryReport: compilerBoundary.redactionReport,
+      structuralFingerprint: fingerprint,
+      capturedValuesReturned: false,
+      llmCalls: 0,
+      openAIRequests: 0,
+    });
+  } catch (error) {
+    res
+      .status(500)
+      .json({ error: error instanceof Error ? error.message : String(error) });
+  }
+});
+app.post("/api/compile", async (req, res) => {
+  const parsedProfileId = StudioProfileIdSchema.safeParse(
+    req.body.studioProfileId,
+  );
+  if (!parsedProfileId.success) {
+    res.status(400).json({ error: "A valid Studio profile is required." });
+    return;
+  }
+  const studioProfile = studioProfiles.find(
+    (candidate) => candidate.id === parsedProfileId.data,
+  )!;
+  if (studioProfile.mode === "clinical") {
+    res
+      .status(403)
+      .json({ error: "Compilation is technically disabled in clinical mode." });
+    return;
+  }
+  let resolved: ReturnType<typeof resolveStudioProfileTarget>;
+  try {
+    resolved = resolveStudioProfileTarget({
+      profileId: parsedProfileId.data,
+      targetUrl: String(req.body.targetUrl ?? ""),
+      purpose: "compile",
+      fixtureOrigin: publicDemoUrl,
+    });
+  } catch (error) {
+    res
+      .status(400)
+      .json({ error: error instanceof Error ? error.message : String(error) });
+    return;
+  }
+  try {
+    requireValidAttestation(
+      req.body.syntheticAttestation,
+      resolved.applicationProfile,
+    );
+  } catch {
+    res.status(403).json({
+      error:
+        "Compilation closed: complete fresh synthetic-environment attestation is required.",
+    });
+    return;
+  }
+  try {
     const instruction =
       typeof req.body.instruction === "string"
         ? req.body.instruction.trim()
@@ -491,16 +1233,266 @@ app.post("/api/compile", async (req, res) => {
       return;
     }
     await ensureWorkflowStorage();
-    const variant = req.body.variant === "B" ? "B" : "A";
+    const captureId =
+      typeof req.body.captureId === "string" ? req.body.captureId : "";
+    const capture = captures.get(captureId);
+    if (!capture || capture.studioProfileId !== studioProfile.id) {
+      res.status(409).json({
+        error:
+          "A fresh attested capture for the active profile is required before compilation.",
+      });
+      return;
+    }
     const workflow = await compileWorkflow({
       instruction,
-      url: demoUrl(internalDemoUrl, variant),
+      url: capture.pageModel.url,
       outDir: WORKFLOW_STORAGE_DIR,
+      pageModel: capture.pageModel,
     });
-    res.json({ workflow });
+    const lifecycle: LifecycleRecord = {
+      workflow,
+      state: "Draft",
+      captureId: capture.id,
+    };
+    lifecycleRecords.set(workflow.id, lifecycle);
+    res.json({ workflow, lifecycle: lifecycleSummary(lifecycle) });
   } catch (error) {
     res
       .status(500)
+      .json({ error: error instanceof Error ? error.message : String(error) });
+  }
+});
+app.get("/api/workflow-lifecycle", (req, res) => {
+  const workflowId = typeof req.query.id === "string" ? req.query.id : "";
+  const record = lifecycleRecords.get(workflowId);
+  if (!record) {
+    res.status(404).json({ error: "No lifecycle record for this workflow." });
+    return;
+  }
+  res.json({ lifecycle: lifecycleSummary(record) });
+});
+app.post("/api/workflows/:workflowId/validate", async (req, res) => {
+  const record = lifecycleRecords.get(req.params.workflowId);
+  if (!record) {
+    res.status(404).json({ error: "Workflow lifecycle record not found." });
+    return;
+  }
+  if (record.state !== "Draft") {
+    res.status(409).json({ error: "Only a Draft can be validated." });
+    return;
+  }
+  const variants: Array<{ variant: "A" | "B"; passed: boolean }> = [];
+  try {
+    for (const variant of ["A", "B"] as const) {
+      const telemetry = await runCompiledWorkflow({
+        workflowPath: workflowArtifactPath(record.workflow.id),
+        url: fixtureUrl(internalDemoUrl, variant),
+        headless: true,
+      });
+      variants.push({
+        variant,
+        passed: telemetry.steps.every((step) => step.status === "passed"),
+      });
+    }
+    const passed = variants.every((variant) => variant.passed);
+    record.validation = { passed, variants };
+    record.state = transitionWorkflow(record.state, "Validated", passed);
+    res.json({ lifecycle: lifecycleSummary(record) });
+  } catch (error) {
+    record.validation = { passed: false, variants };
+    res.status(422).json({
+      error: error instanceof Error ? error.message : String(error),
+      lifecycle: lifecycleSummary(record),
+    });
+  }
+});
+app.post("/api/workflows/:workflowId/approve", (req, res) => {
+  const record = lifecycleRecords.get(req.params.workflowId);
+  if (!record) {
+    res.status(404).json({ error: "Workflow lifecycle record not found." });
+    return;
+  }
+  if (req.body.confirmed !== true) {
+    res.status(400).json({ error: "Explicit human approval is required." });
+    return;
+  }
+  try {
+    record.state = transitionWorkflow(record.state, "Approved");
+    record.approvalTimestamp = new Date().toISOString();
+    res.json({ lifecycle: lifecycleSummary(record) });
+  } catch (error) {
+    res
+      .status(409)
+      .json({ error: error instanceof Error ? error.message : String(error) });
+  }
+});
+app.post("/api/workflows/:workflowId/promote", (req, res) => {
+  const record = lifecycleRecords.get(req.params.workflowId);
+  if (!record) {
+    res.status(404).json({ error: "Workflow lifecycle record not found." });
+    return;
+  }
+  const capture = captures.get(record.captureId);
+  if (!capture || !record.validation?.passed || !record.approvalTimestamp) {
+    res.status(409).json({
+      error:
+        "Promotion requires the original capture, passed validation, and human approval.",
+    });
+    return;
+  }
+  try {
+    const promotionTimestamp = new Date().toISOString();
+    const unsigned: Omit<PromotedWorkflow, "workflowSha256"> = {
+      workflowId: record.workflow.id,
+      workflowVersion: record.workflow.version,
+      applicationProfileId: localFixtureProfile.id,
+      state: "Promoted",
+      allowedRuntimeOrigins: [new URL(internalDemoUrl).origin],
+      allowedPaths: ["/ncba-fixture"],
+      structuralFingerprint: capture.fingerprint,
+      fingerprintVersion: capture.fingerprint.version,
+      compileModel: record.workflow.compileModel,
+      promptVersion: "visual-compiler-v1",
+      compiledFromSyntheticData: true,
+      syntheticAttestationTimestamp: capture.attestedAt,
+      selectedLocators: record.workflow.steps
+        .map((step) => step.selectedLocator?.primary)
+        .filter((locator): locator is string => Boolean(locator)),
+      fallbackLocators: record.workflow.steps
+        .map((step) => step.selectedLocator?.fallback)
+        .filter((locator): locator is string => Boolean(locator)),
+      preconditions: record.workflow.steps.flatMap((step) =>
+        step.preconditions.map((condition) => condition.target),
+      ),
+      postconditions: record.workflow.steps.flatMap((step) =>
+        step.postconditions.map((condition) => condition.target),
+      ),
+      confidence: Math.min(
+        ...record.workflow.steps.map(
+          (step) => step.selectedLocator?.confidence ?? 0,
+        ),
+      ),
+      approvalTimestamp: record.approvalTimestamp,
+      promotionTimestamp,
+      runtimeOpenAIPolicy: "forbidden",
+    };
+    record.state = transitionWorkflow(
+      record.state,
+      "Promoted",
+      record.validation.passed,
+    );
+    record.promotion = {
+      ...unsigned,
+      workflowSha256: computeWorkflowHash(unsigned),
+    };
+    res.json({ lifecycle: lifecycleSummary(record) });
+  } catch (error) {
+    res
+      .status(409)
+      .json({ error: error instanceof Error ? error.message : String(error) });
+  }
+});
+app.post("/api/workflows/:workflowId/preflight", async (req, res) => {
+  const record = lifecycleRecords.get(req.params.workflowId);
+  if (!record?.promotion || record.state !== "Promoted") {
+    res
+      .status(409)
+      .json({ error: "Only a Promoted workflow can run preflight." });
+    return;
+  }
+  try {
+    const runtimeUrl = fixtureUrl(internalDemoUrl, "A", "clinical");
+    const currentPageModel = await captureLocalFixture(runtimeUrl);
+    const currentFingerprint = createStructuralFingerprint(
+      redactCapturedPageModel(currentPageModel),
+    );
+    const result = clinicalPreflight({
+      workflow: record.promotion,
+      profile: fixtureApplicationProfile(),
+      url: runtimeUrl,
+      actualFingerprint: currentFingerprint,
+      targetsUnique: record.validation?.passed === true,
+      preconditionsPassed: record.validation?.passed === true,
+      humanConfirmed: req.body.confirmed === true,
+    });
+    record.lastPreflight = result;
+    res.status(result.allowed ? 200 : 409).json({
+      preflight: result,
+      lifecycle: lifecycleSummary(record),
+      plannedActions: record.workflow.steps.map((step) => ({
+        stepId: step.id,
+        action: step.action,
+        intent: step.intent,
+      })),
+      llmCalls: 0,
+      openAIRequests: 0,
+    });
+  } catch (error) {
+    res
+      .status(500)
+      .json({ error: error instanceof Error ? error.message : String(error) });
+  }
+});
+app.post("/api/workflows/:workflowId/run-promoted", async (req, res) => {
+  const record = lifecycleRecords.get(req.params.workflowId);
+  if (
+    !record?.promotion ||
+    record.state !== "Promoted" ||
+    !record.lastPreflight?.allowed
+  ) {
+    res.status(409).json({
+      error: "A successful visible preflight is required before execution.",
+    });
+    return;
+  }
+  try {
+    const variant = req.body.variant === "B" ? "B" : "A";
+    const runtimeUrl = fixtureUrl(internalDemoUrl, variant, "clinical");
+    const startedAt = new Date().toISOString();
+    const telemetry = await runCompiledWorkflow({
+      workflowPath: workflowArtifactPath(record.workflow.id),
+      url: runtimeUrl,
+      headless: true,
+    });
+    const audit = createRedactedAudit({
+      workflow: record.promotion,
+      origin: runtimeUrl,
+      structuralCompatibility: record.lastPreflight.structuralCompatibility,
+      startTime: startedAt,
+      endTime: new Date().toISOString(),
+      stepIds: telemetry.steps.map((step) => step.stepId),
+      actionTypes: telemetry.steps.map((step) => step.action),
+      stepResults: telemetry.steps.map((step) => step.status),
+      errors: telemetry.steps
+        .filter((step) => step.status === "failed")
+        .map((step) => step.message),
+    });
+    res.json({
+      telemetry,
+      audit,
+      workflowApproved: true,
+      structuralCompatibility: record.lastPreflight.structuralCompatibility,
+      llmCalls: 0,
+      openAIRequests: 0,
+    });
+  } catch (error) {
+    res
+      .status(500)
+      .json({ error: error instanceof Error ? error.message : String(error) });
+  }
+});
+app.post("/api/workflows/:workflowId/revoke", (req, res) => {
+  const record = lifecycleRecords.get(req.params.workflowId);
+  if (!record) {
+    res.status(404).json({ error: "Workflow lifecycle record not found." });
+    return;
+  }
+  try {
+    record.state = transitionWorkflow(record.state, "Revoked");
+    res.json({ lifecycle: lifecycleSummary(record) });
+  } catch (error) {
+    res
+      .status(409)
       .json({ error: error instanceof Error ? error.message : String(error) });
   }
 });

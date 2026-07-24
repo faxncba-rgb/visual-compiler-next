@@ -17,7 +17,7 @@ export default defineConfig({
     },
     {
       command:
-        "STUDIO_PORT=3100 DEMO_SITE_INTERNAL_URL=http://127.0.0.1:4273 DEMO_SITE_PUBLIC_URL=http://127.0.0.1:4273 npm run dev:studio",
+        "STUDIO_PORT=3100 DEMO_SITE_INTERNAL_URL=http://127.0.0.1:4273 DEMO_SITE_PUBLIC_URL=http://127.0.0.1:4273 WORKFLOW_STORAGE_DIR=/private/tmp/visual-compiler-next-e2e-workflows E2E_SEED_WORKFLOW_PATH=compiled-workflows/pending-review.workflow.json npm run dev:studio",
       url: "http://127.0.0.1:3100/health",
       reuseExistingServer: false,
       timeout: 30_000,

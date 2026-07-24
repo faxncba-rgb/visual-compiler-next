@@ -8,6 +8,8 @@ All development and CI use `ncba-dpi-fixture`. The repository records only redac
 
 The 2026-07-23 validation completed with build success, 36/36 tests, the focused 8/8 security suite, a clean scan of 75 repository files, and 8/8 E2E tests. E2E uses isolated loopback ports and never contacts the declared NCBA origin.
 
+For the 2026-07-24 managed-profile milestone, Codex presents implementation and test results before publication, then commits and pushes only after the user's explicit instruction. Automated coverage may select the NCBA profile in Studio but must assert that no request reaches its domain; it must never click the external managed-browser action.
+
 ## Components Codex Designed
 
 - Monorepo structure separating compile-time and runtime packages.

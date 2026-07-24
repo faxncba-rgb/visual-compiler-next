@@ -21,6 +21,7 @@ Synthetic training application
 ## Current MVP
 
 - Strongly typed Application Profiles, including `ncba-dpi` and the local `ncba-dpi-fixture`.
+- Visible Studio selection for `ncba-dpi-fixture`, `ncba-dpi-training`, and `ncba-dpi-clinical`; selecting a profile never opens its URL.
 - Separate visible training and clinical browser-profile definitions.
 - Strict target URL allowlists, protocol and credential checks, redirect checks, and default SSRF denial.
 - Mandatory, expiring synthetic-data attestation with a locally verified synthetic marker.
@@ -33,7 +34,17 @@ Synthetic training application
 - Existing Build Week safeguards: no OpenAI import in runtime, OpenAI HTTP/WebSocket blocking, service workers blocked, `llmCalls: 0`, and `openAIRequests: 0`.
 - An optional compatibility-probe contract that is disabled by default and has not been run.
 
-The Studio is a first professional MVP: the security primitives and promoted-only runtime entry point are implemented and tested, while persisted approval/promotion orchestration and authorized clinical browser integration remain future milestones. Ed25519 signing is deferred; promoted artifacts use verified SHA-256.
+## Managed application profiles
+
+Studio starts on `ncba-dpi-fixture`. The target URL is constrained by the selected profile. `ncba-dpi-training` and `ncba-dpi-clinical` show the configured NCBA origin but do not contact it when selected. Only the explicit **Open in managed browser** action can open that origin, in a visible isolated Playwright profile after an additional confirmation.
+
+Training capture and compilation require every synthetic-environment attestation statement plus a locally verified synthetic marker. The backend returns `403` before capture when attestation is missing or expired. External training compilation can use only the page already opened manually in its managed browser. Clinical mode hides training controls and rejects compilation and compiler-oriented capture at the policy layer.
+
+The compiler boundary receives structural fields and explicitly marked stable labels only. It does not receive cookies, authentication tokens, input or textarea values, contenteditable values, browser storage, headers, form payloads, or network responses.
+
+On the local fixture, Studio visibly demonstrates the complete milestone: redacted capture, mock compilation, `Draft → Validated → Approved → Promoted`, structural preflight, and promoted execution on variants A and B. Redaction counts, the structural SHA-256, planned actions, preflight result, and zero-call runtime telemetry remain visible. `Revoked` is also exposed and immediately closes promoted execution.
+
+The Studio is a first professional MVP: lifecycle orchestration is in memory for this milestone, while durable approval records and authorized clinical browser integration remain future work. Ed25519 signing is deferred; promoted artifacts use verified SHA-256.
 
 ## Local use
 
@@ -50,6 +61,8 @@ Studio: `http://127.0.0.1:3000`
 Synthetic fixture: `http://127.0.0.1:4173/ncba-fixture?mode=training&variant=A`
 
 CI and tests use local fixtures only. They require no OpenAI key and never contact the NCBA DPI.
+
+To exercise the visible fixture journey, open Studio, keep `ncba-dpi-fixture`, check every synthetic attestation statement and the local marker, then use **Capture**, **Compile**, **Validate A/B**, **Approve**, **Promote**, **Run preflight**, and **Execute promoted A/B** in order.
 
 ## Non-negotiable safety boundary
 
