@@ -73,7 +73,7 @@ export const localFixtureProfile: ApplicationProfile =
       "Local, non-clinical fixture containing synthetic administrative data only.",
     trainingOrigins: ["http://127.0.0.1:4173"],
     runtimeOrigins: ["http://127.0.0.1:4173"],
-    allowedPaths: ["/ncba-fixture"],
+    allowedPaths: ["/ncba-fixture", "/cgi-professional"],
   });
 
 export type BrowserMode = "training" | "clinical";

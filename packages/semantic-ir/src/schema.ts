@@ -62,15 +62,17 @@ export const CompiledLocatorSchema = z.object({
         .enum(["checkbox", "button", "textbox", "combobox", "option", "link"])
         .optional(),
       candidateText: z.string().optional(),
-      relation: z.enum([
-        "right-of",
-        "left-of",
-        "below",
-        "above",
-        "same-row",
-        "same-column",
-        "nearest",
-      ]),
+      relation: z
+        .enum([
+          "right-of",
+          "left-of",
+          "below",
+          "above",
+          "same-row",
+          "same-column",
+          "nearest",
+        ])
+        .optional(),
       ordinal: z.number().int().min(1).default(1),
       enabledOnly: z.boolean().default(true),
       visibleOnly: z.boolean().default(true),
@@ -125,6 +127,16 @@ export const CompilationDiagnosticsSchema = z.object({
     })
     .optional(),
   warnings: z.array(z.string()).default([]),
+  locatorDiagnostics: z
+    .array(
+      z.object({
+        stepId: z.string(),
+        candidateCount: z.number().int().nonnegative(),
+        selectedStrategy: LocatorCandidateSchema.shape.strategy.optional(),
+        zeroCandidateReason: z.string().optional(),
+      }),
+    )
+    .default([]),
   durationMs: z.number().min(0),
   rejected: z.boolean().default(false),
 });

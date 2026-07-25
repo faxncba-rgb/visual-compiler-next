@@ -26,6 +26,8 @@ Synthetic training application
 - Strict target URL allowlists, protocol and credential checks, redirect checks, and default SSRF denial.
 - Mandatory, expiring synthetic-data attestation with a locally verified synthetic marker.
 - Page-model redaction excluding values, storage, cookies, network data, sensitive URL parameters, and sensitive nodes.
+- Classified semantic compiler payload retaining only control names, associated labels, generic placeholders/control text, nearby structural headings, geometry and DOM/visual relations.
+- Exact redacted-payload preview plus mandatory human confirmation before any Training compilation.
 - Data-independent structural fingerprints and redacted compatibility differences.
 - `Draft → Validated → Approved → Promoted → Revoked` lifecycle with immutable SHA-256 verification.
 - Fail-closed clinical preflight, redacted audit structures, and ephemeral runtime parameters.
@@ -40,7 +42,9 @@ Studio starts on `ncba-dpi-fixture`. The target URL is constrained by the select
 
 Training capture and compilation require every synthetic-environment attestation statement plus a locally verified synthetic marker. The backend returns `403` before capture when attestation is missing or expired. External training compilation can use only the page already opened manually in its managed browser. Clinical mode hides training controls and rejects compilation and compiler-oriented capture at the policy layer.
 
-The compiler boundary receives structural fields and explicitly marked stable labels only. It does not receive cookies, authentication tokens, input or textarea values, contenteditable values, browser storage, headers, form payloads, or network responses.
+The compiler boundary receives only the reviewed value-free semantic payload. It does not receive cookies, authentication tokens, input or textarea values, contenteditable values, browser storage, headers, form payloads, or network responses.
+
+The compiler boundary no longer depends on fixture-only test attributes. For visible interactive controls it may retain computed accessible names, associated labels, resolved `aria-labelledby`, `aria-label`, generic placeholders, button/link/option text, nearby structural headings, bounding boxes, state, and deterministic DOM/visual order. Every retained text is classified as `interface-label`, `control-name`, or `structural-heading`; removed values and arbitrary content appear only as count-based `redacted-value` / `excluded-content` markers. Studio shows the exact canonical JSON payload and requires an explicit review checkbox before `/api/compile` will proceed.
 
 The managed Training flow has two explicit phases. During **AUTHENTICATION BOOTSTRAP**, temporary HTTPS redirects, popups, iframe navigation, and subresources may cross origins so the user can authenticate manually. Capture and compilation stay technically disabled, OpenAI domains and unsafe schemes remain blocked, and Studio displays only the current origin. When the primary page returns to the exact configured application origin, the user must choose **Authentication complete — lock to application**. **APPLICATION LOCKED** then rejects main-page navigation away from that origin while allowing required HTTPS subresources and iframes; cross-origin frames are excluded from capture.
 
@@ -67,6 +71,8 @@ Synthetic fixture: `http://127.0.0.1:4173/ncba-fixture?mode=training&variant=A`
 CI and tests use local fixtures only. They require no OpenAI key and never contact the NCBA DPI.
 
 The SSO regression test uses two loopback origins: a synthetic application and a synthetic identity provider. Its HTTP exception is available only when `ALLOW_EXPLICIT_LOCAL_SSO_FIXTURE=true` and the configured application origin is loopback. Production profiles remain HTTPS-only.
+
+The local `/cgi-professional` fixture intentionally contains multiple textareas and multiple **Enregistrer** buttons without `data-vc-stable-label`. Its offline test instruction compiles through ranked accessibility, label, DOM and spatial candidates, then replays locally with zero OpenAI calls. The fixture contains only conspicuously synthetic values used to prove that field contents and query parameters never enter the compiler payload or artifact.
 
 To exercise the visible fixture journey, open Studio, keep `ncba-dpi-fixture`, check every synthetic attestation statement and the local marker, then use **Capture**, **Compile**, **Validate A/B**, **Approve**, **Promote**, **Run preflight**, and **Execute promoted A/B** in order.
 

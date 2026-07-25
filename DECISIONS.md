@@ -1,5 +1,11 @@
 # Decisions
 
+## 2026-07-25 — Classified semantic text instead of text-free compiler models
+
+The compiler boundary retains only bounded interface text that identifies interactive controls: computed accessible names, associated labels, ARIA label sources, generic placeholders, control text, and nearby structural headings. Form values, hidden fields, arbitrary page content, query parameters, browser state, and network material remain excluded. Retained text is explicitly classified and must be reviewed in Studio before compilation. This is the minimum reliable alternative to depending on fixture-only test attributes.
+
+Locator selection uses a deterministic ranked cascade and records per-step candidate counts. DOM-container and spatial relationships disambiguate repeated control names. Absolute coordinates remain unacceptable as the only strategy.
+
 ## 2026-07-22 — Post-hackathon safety boundary
 
 - Preserve Build Week Git history in a new repository and disable pushes to `upstream-build-week`.

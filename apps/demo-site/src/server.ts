@@ -1,5 +1,6 @@
 import express from "express";
 import { renderDemoPage, type DemoVariant } from "./renderDemoPage.js";
+import { renderCgiFixture } from "./renderCgiFixture.js";
 import { renderNcbaFixture } from "./renderNcbaFixture.js";
 
 export function createDemoServer(
@@ -26,6 +27,9 @@ export function createDemoServer(
     const mode = req.query.mode === "clinical" ? "clinical" : "training";
     const variant = req.query.variant === "B" ? "B" : "A";
     res.type("html").send(renderNcbaFixture(mode, variant));
+  });
+  app.get("/cgi-professional", (_req, res) => {
+    res.type("html").send(renderCgiFixture());
   });
   app.get("/sso-app/start", (_req, res) => {
     const returnTo = `http://127.0.0.1:${port}/sso-app/callback?session_token=SYNTHETIC-RETURN-TOKEN`;

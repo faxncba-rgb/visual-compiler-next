@@ -1,5 +1,17 @@
 # Progress
 
+## 2026-07-25 — Privacy-preserving semantic locator recovery
+
+- Confirmed that the previous compiler payload removed the accessible names and labels required by the locator engine, leaving external controls without candidates when no fixture-only stable label existed.
+- Added a classified semantic payload retaining bounded interface labels/control names/structural headings, accessibility sources, control state, geometry, and DOM/visual relations while excluding form values, hidden fields, URL parameters, storage, cookies, headers, and network data.
+- Studio now displays the exact redacted compiler payload and requires an explicit SHA-bound human confirmation before Training compilation.
+- Locator generation now ranks role/name, label, placeholder/type, control text, DOM relation, spatial relation, role ordinal, and deterministic control-type fallback candidates. Per-step counts and redacted zero-candidate explanations are visible.
+- Added `/cgi-professional`, a wholly synthetic local fixture with multiple textareas and duplicate Save buttons but no `data-vc-stable-label`.
+- The documented French fill-then-save instruction compiles with the offline mock and replays on the fixture with `llmCalls: 0` and `openAIRequests: 0`.
+- Final validation: build passed; 45/45 unit and integration tests passed; 8/8 focused security tests plus a 78-file secret/import scan passed; and 12/12 Playwright E2E tests passed with one worker.
+- Visual Studio verification confirmed that Compile remains disabled before payload approval, the preview excludes both synthetic form values and all query parameters, and confirmed compilation produces 8 candidates for the labelled textarea and 10 for the duplicate Save-button step.
+- No DPI request, real capture content, patient data, or OpenAI call was used during implementation or tests.
+
 ## 2026-07-25 — Manual SSO bootstrap and application lock
 
 - Added visible `AUTHENTICATION IN PROGRESS — capture and compilation disabled` and `APPLICATION LOCKED` states to Studio.

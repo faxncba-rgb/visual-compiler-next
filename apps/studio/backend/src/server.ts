@@ -1,5 +1,5 @@
 import express from "express";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { constants, existsSync } from "node:fs";
 import {
   access,
@@ -152,6 +152,8 @@ const captures = new Map<
     fingerprint: StructuralFingerprint;
     attestedAt: string;
     managedSessionId?: string;
+    compilerPayload: ReturnType<typeof createRedactedCompilerPageModel>;
+    compilerPayloadSha256: string;
   }
 >();
 type LifecycleRecord = {
@@ -347,7 +349,13 @@ async function openManagedBrowser(profileId: StudioProfileId, target: URL) {
       }),
   );
   try {
-    await primaryPage.goto(target.toString());
+    // Authentication portals and professional CGI applications can keep the
+    // load event pending. The bootstrap only needs the first committed
+    // navigation; origin polling observes subsequent SSO redirects.
+    await primaryPage.goto(target.toString(), {
+      waitUntil: "commit",
+      timeout: 10_000,
+    });
     await primaryPage.bringToFront();
     return session;
   } catch (error) {
@@ -501,6 +509,8 @@ function studioHtml() {
     .report-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; margin: 14px 0; }
     .report-grid > div { min-width: 0; }
     .report-grid pre { margin-top: 6px; max-height: 220px; }
+    .compiler-preview { margin: 14px 0; padding: 12px; border: 1px solid #65bff3; border-radius: 8px; background: #131a22; }
+    .compiler-preview pre { max-height: 360px; margin: 8px 0; }
     input[type="url"] { width: 100%; min-height: 44px; border: 1px solid #3b4555; background: #171b22; color: white; border-radius: 7px; padding: 10px; font-size: 16px; }
     @media (max-width: 980px) {
       .app { grid-template-columns: 1fr; min-height: auto; }
@@ -581,6 +591,14 @@ function studioHtml() {
           <button class="secondary" id="runB">Run B</button>
         </div>
         <p class="hint">Capture and compilation remain closed until every attestation control is checked. Run A/B replays only the local Build Week fixture.</p>
+        <div class="compiler-preview" aria-label="Redacted compiler payload review">
+          <strong>Exact redacted payload preview</strong>
+          <p class="hint">Only this canonical, classified semantic payload may cross the compiler boundary. Form values, query parameters, storage, cookies, headers and network data are excluded.</p>
+          <pre id="compilerPayloadPreview">Capture required.</pre>
+          <label><input type="checkbox" id="compilerPayloadConfirmation" disabled> I reviewed this exact redacted payload and confirm that it contains synthetic interface semantics only.</label>
+          <strong>Locator diagnostics</strong>
+          <pre id="locatorDiagnostics">Compilation required.</pre>
+        </div>
       </section>
       <section class="mode-panel" id="fixtureLifecyclePanel" aria-label="Fixture workflow lifecycle">
         <div class="mode-title">FIXTURE WORKFLOW JOURNEY</div>
@@ -671,6 +689,7 @@ OpenAI requests: 0</pre>
     const captureButton = document.getElementById("capture");
     const attestationInputs = Array.from(document.querySelectorAll("[data-attestation-key]"));
     const indicatorVerified = document.getElementById("indicatorVerified");
+    const compilerPayloadConfirmation = document.getElementById("compilerPayloadConfirmation");
     const controls = Array.from(document.querySelectorAll("button, select, input, textarea"));
     let targetValidationTimer;
     let authenticationPollTimer;
@@ -700,7 +719,8 @@ OpenAI requests: 0</pre>
         !attested ||
         !state.targetValid ||
         !managedApplicationReady ||
-        !state.capture;
+        !state.capture ||
+        !compilerPayloadConfirmation.checked;
       document.getElementById("lockManagedBrowser").disabled =
         !state.canLockAuthentication ||
         state.authenticationPhase !== "authentication-bootstrap";
@@ -751,6 +771,10 @@ OpenAI requests: 0</pre>
     };
     const resetCapture = () => {
       state.capture = null;
+      compilerPayloadConfirmation.checked = false;
+      compilerPayloadConfirmation.disabled = true;
+      document.getElementById("compilerPayloadPreview").textContent = "Capture required.";
+      document.getElementById("locatorDiagnostics").textContent = "Compilation required.";
       document.getElementById("redactionReport").textContent = "Capture required.";
       document.getElementById("fingerprintReport").textContent = "Capture required.";
       syncJourneyControls();
@@ -773,6 +797,9 @@ OpenAI requests: 0</pre>
             ? " — query parameters will remain memory-only and will be removed from logs and artifacts."
             : " — no query parameters.");
         validation.className = "hint ok";
+        if (state.profile.id === "ncba-dpi-fixture") {
+          document.getElementById("demo").src = targetUrl.value;
+        }
       } catch {
         validation.textContent = "Target rejected by the active Application Profile.";
         validation.className = "hint error";
@@ -949,8 +976,13 @@ OpenAI requests: 0</pre>
           syntheticAttestation: syntheticAttestation()
         });
         state.capture = json;
+        compilerPayloadConfirmation.checked = false;
+        compilerPayloadConfirmation.disabled = false;
+        document.getElementById("compilerPayloadPreview").textContent =
+          JSON.stringify(json.compilerPayload, null, 2);
         document.getElementById("redactionReport").textContent = JSON.stringify({
           ...json.redactionReport,
+          compilerBoundary: json.compilerBoundaryReport,
           cookiesCaptured: false,
           storageCaptured: false,
           networkCaptured: false,
@@ -981,12 +1013,16 @@ OpenAI requests: 0</pre>
           studioProfileId: state.profile.id,
           targetUrl: targetUrl.value,
           captureId: state.capture?.captureId,
+          compilerPayloadConfirmed: compilerPayloadConfirmation.checked,
+          compilerPayloadSha256: state.capture?.compilerPayloadSha256,
           syntheticAttestation: syntheticAttestation()
         });
         await refreshWorkflowList(json.workflow.id);
         applyWorkflow(json.workflow);
         state.lifecycle = json.lifecycle;
         state.preflight = null;
+        document.getElementById("locatorDiagnostics").textContent =
+          JSON.stringify(json.workflow.diagnostics.locatorDiagnostics, null, 2);
         renderLifecycle();
         setStatus("Compiled — Draft", "ok");
       } catch (error) {
@@ -1198,11 +1234,12 @@ OpenAI requests: 0</pre>
         setBusy(false);
       }
     });
-    [...attestationInputs, indicatorVerified].forEach(input => {
+    [...attestationInputs, indicatorVerified, compilerPayloadConfirmation].forEach(input => {
       input.addEventListener("change", syncJourneyControls);
     });
     targetUrl.addEventListener("input", () => {
       state.targetValid = false;
+      resetCapture();
       document.getElementById("targetValidation").textContent =
         "Target changed — local validation required.";
       document.getElementById("targetValidation").className = "hint warn";
@@ -1627,6 +1664,10 @@ app.post("/api/capture", async (req, res) => {
     }
     const redactedModel = redactCapturedPageModel(pageModel);
     const fingerprint = createStructuralFingerprint(redactedModel);
+    const compilerPayload = createRedactedCompilerPageModel(pageModel);
+    const compilerPayloadSha256 = createHash("sha256")
+      .update(JSON.stringify(compilerPayload))
+      .digest("hex");
     const id = randomUUID();
     captures.set(id, {
       id,
@@ -1636,13 +1677,16 @@ app.post("/api/capture", async (req, res) => {
       fingerprint,
       attestedAt: attestation.attestedAt,
       managedSessionId,
+      compilerPayload,
+      compilerPayloadSha256,
     });
-    const compilerBoundary = createRedactedCompilerPageModel(pageModel);
     res.json({
       captureId: id,
       profileId: studioProfile.id,
       redactionReport: redactedModel.report,
-      compilerBoundaryReport: compilerBoundary.redactionReport,
+      compilerBoundaryReport: compilerPayload.redactionReport,
+      compilerPayload,
+      compilerPayloadSha256,
       structuralFingerprint: fingerprint,
       crossOriginFramesExcluded,
       capturedValuesReturned: false,
@@ -1734,6 +1778,16 @@ app.post("/api/compile", async (req, res) => {
       res.status(409).json({
         error:
           "A fresh attested capture for the active profile is required before compilation.",
+      });
+      return;
+    }
+    if (
+      req.body.compilerPayloadConfirmed !== true ||
+      req.body.compilerPayloadSha256 !== capture.compilerPayloadSha256
+    ) {
+      res.status(428).json({
+        error:
+          "Compilation closed: review and explicitly confirm the exact redacted compiler payload.",
       });
       return;
     }

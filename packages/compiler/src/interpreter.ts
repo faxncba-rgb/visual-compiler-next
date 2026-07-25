@@ -21,36 +21,242 @@ export const InterpreterResponseSchema = z.object({
 
 export type InterpreterResponse = z.infer<typeof InterpreterResponseSchema>;
 
+export const CompilerTextClassificationSchema = z.enum([
+  "interface-label",
+  "control-name",
+  "structural-heading",
+  "redacted-value",
+  "excluded-content",
+]);
+export type CompilerTextClassification = z.infer<
+  typeof CompilerTextClassificationSchema
+>;
+
+function normalizedInterfaceText(value: string | undefined) {
+  const normalized = value?.replace(/\s+/g, " ").trim().slice(0, 160);
+  if (!normalized) return undefined;
+  if (
+    /(?:https?:\/\/|bearer\s+|token\s*[=:]|session\s*[=:]|cookie\s*[=:])/i.test(
+      normalized,
+    ) ||
+    /[\w.+-]+@[\w.-]+\.[a-z]{2,}/i.test(normalized) ||
+    /\b[0-9a-f]{8}-[0-9a-f-]{27,}\b/i.test(normalized) ||
+    /\b\d{8,}\b/.test(normalized)
+  ) {
+    return undefined;
+  }
+  return normalized;
+}
+
 export function createRedactedCompilerPageModel(model: PageModel) {
   const url = new URL(canonicalizeTargetUrl(model.url));
-  return {
-    origin: url.origin,
-    path: url.pathname,
-    viewport: model.viewport,
-    nodes: model.nodes.map((node, structuralIndex) => ({
+  const interactiveRoles = new Set([
+    "button",
+    "checkbox",
+    "textbox",
+    "searchbox",
+    "combobox",
+    "option",
+    "link",
+    "radio",
+    "switch",
+    "tab",
+    "menuitem",
+  ]);
+  const structuralTags = new Set([
+    "form",
+    "section",
+    "fieldset",
+    "legend",
+    "label",
+    "main",
+    "article",
+    "dialog",
+    "table",
+    "thead",
+    "tbody",
+    "tr",
+    "th",
+    "caption",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
+  ]);
+  const included = model.nodes.filter(
+    (node) =>
+      node.visible &&
+      node.attributes.type !== "hidden" &&
+      (interactiveRoles.has(node.role ?? "") ||
+        structuralTags.has(node.tagName)),
+  );
+  const includedIds = new Set(included.map((node) => node.id));
+  const rawById = new Map(model.nodes.map((node) => [node.id, node]));
+  const structuralIndexById = new Map(
+    included.map((node, structuralIndex) => [node.id, structuralIndex]),
+  );
+  const nearestIncludedAncestor = (parentId: string | undefined) => {
+    let currentId = parentId;
+    while (currentId) {
+      if (includedIds.has(currentId)) return structuralIndexById.get(currentId);
+      currentId = rawById.get(currentId)?.parentId;
+    }
+    return undefined;
+  };
+  const textEntry = (
+    classification: CompilerTextClassification,
+    source: string,
+    rawValue: string | undefined,
+  ) => {
+    const text = normalizedInterfaceText(rawValue);
+    return text
+      ? { classification, source, text }
+      : rawValue
+        ? {
+            classification: "redacted-value" as const,
+            source,
+            text: "[REDACTED]",
+          }
+        : undefined;
+  };
+  let accessibleNamesKept = 0;
+  let labelsKept = 0;
+  let valuesRemoved = 0;
+  let sensitiveTextsRemoved = 0;
+  const nodes = included.map((node, structuralIndex) => {
+    const accessibleName = normalizedInterfaceText(node.accessibleName);
+    const labelText = normalizedInterfaceText(node.labelText);
+    const ariaLabel = normalizedInterfaceText(node.ariaLabel);
+    const ariaLabelledByText = normalizedInterfaceText(
+      node.ariaLabelledByText,
+    );
+    const placeholder = normalizedInterfaceText(node.placeholder);
+    const controlText = normalizedInterfaceText(node.controlText);
+    const structuralHeading = normalizedInterfaceText(node.structuralHeading);
+    accessibleNamesKept += Number(Boolean(accessibleName));
+    labelsKept += Number(
+      Boolean(labelText || ariaLabel || ariaLabelledByText),
+    );
+    const rawSemanticTexts = [
+      ["control-name", "accessible-name", node.accessibleName],
+      ["interface-label", "associated-label", node.labelText],
+      ["interface-label", "aria-label", node.ariaLabel],
+      ["interface-label", "aria-labelledby", node.ariaLabelledByText],
+      ["interface-label", "placeholder", node.placeholder],
+      ["control-name", "control-text", node.controlText],
+      ["structural-heading", "nearest-heading", node.structuralHeading],
+    ] as const;
+    const texts = rawSemanticTexts
+      .map(([classification, source, value]) => {
+        const entry = textEntry(classification, source, value);
+        if (entry?.classification === "redacted-value")
+          sensitiveTextsRemoved += 1;
+        return entry;
+      })
+      .filter((entry) => entry !== undefined)
+      .filter(
+        (entry, index, entries) =>
+          entries.findIndex(
+            (candidate) =>
+              candidate.classification === entry.classification &&
+              candidate.text === entry.text,
+          ) === index,
+      );
+    const children = included
+      .filter((candidate) => candidate.parentId === node.id)
+      .map((candidate) => structuralIndexById.get(candidate.id))
+      .filter((index) => index !== undefined);
+    return {
       structuralIndex,
       tagName: node.tagName,
       role: node.role,
-      stableLabel: node.attributes["data-vc-stable-label"],
-      controlType: node.attributes.type ?? node.tagName,
+      controlType: node.controlType ?? node.attributes.type ?? node.tagName,
+      stableLabel: normalizedInterfaceText(
+        node.attributes["data-vc-stable-label"],
+      ),
+      accessibleName,
+      labelText,
+      ariaLabel,
+      ariaLabelledByText,
+      placeholder,
+      controlText,
+      structuralHeading,
+      texts,
       box: node.box,
       visible: node.visible,
       enabled: node.enabled,
       checked: node.checked,
-    })),
+      parentIndex: nearestIncludedAncestor(node.parentId),
+      childIndices: children,
+      previousSiblingIndex: structuralIndexById.get(
+        node.previousSiblingId ?? "",
+      ),
+      nextSiblingIndex: structuralIndexById.get(node.nextSiblingId ?? ""),
+      domOrder: node.domOrder ?? structuralIndex,
+      visualOrder: node.visualOrder ?? structuralIndex,
+    };
+  });
+  const fieldsRemoved = model.nodes.reduce(
+    (count, node) =>
+      count +
+      Object.keys(node.attributes).filter(
+        (name) =>
+          ![
+            "type",
+            "aria-label",
+            "aria-labelledby",
+            "placeholder",
+            "required",
+            "data-vc-stable-label",
+          ].includes(name),
+      ).length,
+    0,
+  );
+  valuesRemoved += model.nodes.reduce(
+    (count, node) =>
+      count +
+      Number(node.valueWasPresent === true) +
+      Number(Boolean(node.attributes.value)) +
+      Number(Boolean(node.attributes.selected)) +
+      Number(Boolean(node.attributes["data-value"])),
+    0,
+  );
+  return {
+    origin: url.origin,
+    path: url.pathname,
+    viewport: model.viewport,
+    textPolicy: {
+      classifications: CompilerTextClassificationSchema.options,
+      arbitraryContentIncluded: false,
+      formValuesIncluded: false,
+    },
+    redactionMarkers: [
+      {
+        classification: "redacted-value" as const,
+        count: valuesRemoved,
+        text: "[REDACTED]",
+      },
+      {
+        classification: "excluded-content" as const,
+        count: model.nodes.length - included.length,
+        text: "[EXCLUDED]",
+      },
+    ],
+    nodes,
     redactionReport: {
-      fieldsRemoved: model.nodes.reduce(
-        (count, node) => count + Object.keys(node.attributes).length,
-        0,
-      ),
-      valuesRemoved: model.nodes.reduce(
-        (count, node) =>
-          count +
-          Number(Boolean(node.text)) +
-          Number(Boolean(node.accessibleName)),
-        0,
-      ),
-      sensitiveNodesRemoved: 0,
+      nodesCaptured: model.nodes.length,
+      nodesIncluded: nodes.length,
+      interactiveElements: nodes.filter((node) =>
+        interactiveRoles.has(node.role ?? ""),
+      ).length,
+      accessibleNamesKept,
+      labelsKept,
+      fieldsRemoved,
+      valuesRemoved,
+      sensitiveTextsRemoved,
+      sensitiveNodesRemoved: model.nodes.length - included.length,
       cookiesCaptured: false as const,
       storageCaptured: false as const,
       networkCaptured: false as const,
@@ -148,15 +354,107 @@ function normalizeInstruction(instruction: string) {
   return instruction.trim().replace(/\s+/g, " ");
 }
 
+export const CGI_FIXTURE_INSTRUCTION =
+  "Dans la zone de texte, écris « test du DR LEROY », puis clique sur « Enregistrer ».";
+
 export function mockInterpretInstruction(
   instruction = DEFAULT_INSTRUCTION,
 ): InterpreterResponse {
-  if (
-    normalizeInstruction(instruction) !==
-    normalizeInstruction(DEFAULT_INSTRUCTION)
-  ) {
+  const normalizedInstruction = normalizeInstruction(instruction);
+  if (normalizedInstruction === normalizeInstruction(CGI_FIXTURE_INSTRUCTION)) {
+    return InterpreterResponseSchema.parse({
+      name: "Synthetic CGI administrative note",
+      assumptions: [
+        "The textarea identified by its associated interface label is the intended reversible administrative field.",
+      ],
+      ambiguityWarnings: [
+        "Several Save buttons exist; the nearest shared form section disambiguates the target deterministically.",
+      ],
+      confidence: 0.94,
+      expectedResult:
+        "The synthetic administrative textarea contains the requested test text and its section reports a saved state.",
+      steps: [
+        {
+          id: "fill-administrative-observation",
+          action: "fill",
+          intent:
+            "Fill the multiline field labelled Observation du praticien.",
+          target: {
+            role: "textbox",
+            accessibleName: "Observation du praticien",
+            state: "enabled",
+            relations: [
+              {
+                relation: "nearest",
+                anchorText: "Observation du praticien",
+                tolerancePx: 40,
+              },
+            ],
+          },
+          value: "test du DR LEROY",
+          preconditions: [
+            {
+              type: "element-visible",
+              target: "Observation du praticien",
+              expected: true,
+            },
+            {
+              type: "element-enabled",
+              target: "Observation du praticien",
+              expected: true,
+            },
+          ],
+          postconditions: [
+            {
+              type: "element-visible",
+              target: "Observation du praticien",
+              expected: true,
+            },
+          ],
+        },
+        {
+          id: "save-administrative-observation",
+          action: "click",
+          intent:
+            "Click the Save button in the same administrative section as the textarea.",
+          target: {
+            role: "button",
+            accessibleName: "Enregistrer",
+            state: "enabled",
+            relations: [
+              {
+                relation: "nearest",
+                anchorText: "Observation du praticien",
+                tolerancePx: 60,
+              },
+            ],
+          },
+          preconditions: [
+            {
+              type: "element-visible",
+              target: "Enregistrer",
+              expected: true,
+            },
+            {
+              type: "element-enabled",
+              target: "Enregistrer",
+              expected: true,
+            },
+          ],
+          postconditions: [
+            {
+              type: "text-visible",
+              target: "Enregistrement synthétique effectué",
+              expected: "Enregistrement synthétique effectué",
+            },
+          ],
+        },
+      ],
+    });
+  }
+  if (normalizedInstruction !== normalizeInstruction(DEFAULT_INSTRUCTION)) {
     throw new Error(
-      "The offline mock interpreter supports only the documented Pending review fixture. Enable live compilation for other instructions.",
+      "The offline mock interpreter supports only the documented Pending review and synthetic CGI fixtures. Enable live compilation only after a separate explicit authorization.",
     );
   }
   return InterpreterResponseSchema.parse({
@@ -264,7 +562,7 @@ export async function interpretInstructionWithOpenAI(
       {
         role: "system",
         content:
-          "Interpret the browser instruction into ordered semantic workflow steps using the supplied page model. Prefer accessibility and spatial relationships over generated IDs or classes. Preserve the requested action order, report material ambiguity, and do not generate Playwright code. Return only the structured result.",
+          "Interpret the browser instruction into ordered semantic workflow steps using only the supplied redacted semantic page model. Prefer role plus accessible name, associated labels, placeholders, control text, DOM relations, then spatial relations. Never infer or reproduce excluded values. Preserve the requested action order, report material ambiguity, and do not generate Playwright code. Return only the structured result.",
       },
       {
         role: "user",

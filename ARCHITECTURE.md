@@ -19,6 +19,10 @@ flowchart LR
 
 `packages/clinical-safety` owns profiles, URL policy, attestation, redaction, structural fingerprints, workflow lifecycle, preflight, audit redaction, and ephemeral parameters. `packages/compiler` remains the only OpenAI-capable package. `packages/runtime` has no OpenAI dependency and blocks browser requests to OpenAI. `apps/demo-site` hosts only controlled fixtures. `apps/studio` exposes distinct training and clinical surfaces.
 
+`packages/page-model` extracts a value-free semantic graph in memory. It records interactive roles/control types, accessibility names and label sources, bounded control/interface text, nearby headings, geometry, state, parent/child/sibling references, and DOM/visual order. Hidden controls and arbitrary body content are excluded. `createRedactedCompilerPageModel` canonicalizes the URL to `origin + pathname`, filters to interactive/structural nodes, classifies retained text, and emits count-only redaction diagnostics. Studio binds human confirmation to the SHA-256 of that exact preview.
+
+`packages/locator-engine` ranks deterministic candidates in this order: role/name, associated label, placeholder/control type, control text, DOM-anchor relation, spatial relation, role ordinal, and control-type ordinal. Compilation records the candidate count and selected strategy for every step; zero-candidate errors expose only redacted counts, never captured labels or values.
+
 Training and clinical may share an origin, so mode is never inferred from origin. Separate browser profile IDs, independent manually authenticated sessions, explicit attestation, artifact state, and backend authorization distinguish them.
 
 Managed Training navigation is a two-state machine:

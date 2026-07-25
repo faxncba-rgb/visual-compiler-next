@@ -120,6 +120,11 @@ test("Studio visibly demonstrates capture through promoted A/B execution", async
     '"networkCaptured": false',
   );
   await expect(page.locator("#fingerprintReport")).toContainText('"sha256"');
+  await expect(page.locator("#compilerPayloadPreview")).toContainText(
+    '"classifications"',
+  );
+  await expect(compile).toBeDisabled();
+  await page.locator("#compilerPayloadConfirmation").check();
   await expect(compile).toBeEnabled();
 
   await compile.click();
@@ -481,6 +486,8 @@ test("managed Training completes synthetic popup SSO before strict application l
     expect(captureReportText).not.toContain(forbidden);
   }
 
+  await expect(page.getByRole("button", { name: "Compile" })).toBeDisabled();
+  await page.locator("#compilerPayloadConfirmation").check();
   await page.getByRole("button", { name: "Compile" }).click();
   await expect(page.locator("#status")).toHaveText("Compiled — Draft", {
     timeout: 15_000,

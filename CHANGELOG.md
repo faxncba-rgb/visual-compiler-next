@@ -12,6 +12,10 @@
 - Added an explicit `AUTHENTICATION BOOTSTRAP → APPLICATION LOCKED` managed-browser flow for manual SSO.
 - Kept capture and compilation closed during bootstrap, added an exact-origin human lock, and resumed strict primary-navigation enforcement after lock.
 - Added a two-origin synthetic SSO fixture covering redirect, popup, cross-origin iframe exclusion, query/token redaction, OpenAI blocking, and post-lock escape blocking.
+- Replaced the fixture-only compiler boundary with a classified value-free semantic payload containing accessibility, label, structural, DOM and visual information.
+- Added exact payload preview and SHA-bound human confirmation before Training compilation.
+- Added ranked locator fallbacks that work without test attributes, per-step candidate diagnostics, and count-only zero-candidate explanations.
+- Added a professional CGI-style local fixture with duplicate textareas/buttons and an offline fill-then-save E2E replay.
 
 ## 0.2.0 — 2026-07-22
 

@@ -4,6 +4,7 @@ import path from "node:path";
 import { chromium } from "playwright";
 import { extractPageModel, type PageModel } from "@visual-compiler/page-model";
 import {
+  explainZeroCandidates,
   generateCandidates,
   selectBestCandidate,
 } from "@visual-compiler/locator-engine";
@@ -80,12 +81,35 @@ export async function compileWorkflow(
     options.instruction,
     compilerPageModel,
   );
+  const locatorDiagnostics: Array<{
+    stepId: string;
+    candidateCount: number;
+    selectedStrategy?: ReturnType<typeof selectBestCandidate>["strategy"];
+    zeroCandidateReason?: string;
+  }> = [];
   const steps = interpretation.result.steps.map((step) => {
     const candidates = generateCandidates(
       compilerPageModel,
       step as SemanticStep,
     );
+    if (candidates.length === 0) {
+      const zeroCandidateReason = explainZeroCandidates(
+        compilerPageModel,
+        step as SemanticStep,
+      );
+      locatorDiagnostics.push({
+        stepId: step.id,
+        candidateCount: 0,
+        zeroCandidateReason,
+      });
+      throw new Error(zeroCandidateReason);
+    }
     const selected = selectBestCandidate(candidates);
+    locatorDiagnostics.push({
+      stepId: step.id,
+      candidateCount: candidates.length,
+      selectedStrategy: selected.strategy,
+    });
     return {
       ...step,
       candidates,
@@ -95,7 +119,7 @@ export async function compileWorkflow(
         fallback: candidates[1]?.selector,
         rule: {
           anchorText: step.target.relations[0]?.anchorText,
-          candidateRole: step.target.role as
+          candidateRole: (selected.node?.role ?? step.target.role) as
             | "checkbox"
             | "button"
             | "textbox"
@@ -103,7 +127,8 @@ export async function compileWorkflow(
             | "option"
             | "link"
             | undefined,
-          candidateText: step.target.accessibleName,
+          candidateText:
+            selected.node?.accessibleName ?? step.target.accessibleName,
           relation:
             step.target.relations[0]?.relation === "next-to"
               ? "nearest"
@@ -146,6 +171,7 @@ export async function compileWorkflow(
       responseModel: interpretation.responseModel,
       tokenUsage: interpretation.tokenUsage,
       warnings: interpretation.result.ambiguityWarnings,
+      locatorDiagnostics,
       durationMs: Date.now() - started,
       rejected: false,
     },
@@ -182,6 +208,7 @@ export async function compileWorkflow(
 }
 
 export {
+  CGI_FIXTURE_INSTRUCTION,
   createRedactedCompilerPageModel,
   InterpreterResponseSchema,
   interpreterResponseFormat,

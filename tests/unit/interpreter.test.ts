@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  CGI_FIXTURE_INSTRUCTION,
   interpreterResponseFormat,
   mockInterpretInstruction,
 } from "@visual-compiler/compiler";
@@ -27,12 +28,17 @@ describe("GPT-5.6 interpreter response format", () => {
     expectStrictObjects(interpreterResponseFormat.schema);
   });
 
-  it("limits the offline mock to the documented fixture instruction", () => {
+  it("limits the offline mock to the two documented fixture instructions", () => {
     expect(mockInterpretInstruction(DEFAULT_INSTRUCTION).steps).toHaveLength(2);
+    expect(
+      mockInterpretInstruction(CGI_FIXTURE_INSTRUCTION).steps.map(
+        (step) => step.action,
+      ),
+    ).toEqual(["fill", "click"]);
     expect(() =>
       mockInterpretInstruction(
         "Check the Invoice packet primary checkbox and confirm.",
       ),
-    ).toThrow(/supports only the documented Pending review fixture/);
+    ).toThrow(/Pending review and synthetic CGI fixtures/);
   });
 });

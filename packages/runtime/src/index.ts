@@ -45,7 +45,7 @@ async function resolveSemanticLocator(
     const direct = page.getByRole(rule.candidateRole, {
       name: rule.candidateText,
     });
-    if ((await direct.count()) > 0) return direct.first();
+    if ((await direct.count()) === 1) return direct;
   }
 
   if (!rule.anchorText || !rule.candidateRole) {
