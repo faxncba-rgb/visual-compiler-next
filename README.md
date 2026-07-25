@@ -42,6 +42,8 @@ Training capture and compilation require every synthetic-environment attestation
 
 The compiler boundary receives structural fields and explicitly marked stable labels only. It does not receive cookies, authentication tokens, input or textarea values, contenteditable values, browser storage, headers, form payloads, or network responses.
 
+The NCBA training profile allows any HTTPS pathname and dynamic query string on the exact configured origin. The full URL exists only in the managed-browser navigation call and in-memory capture. Before compiler input, persistence, fingerprinting, or audit output, it is canonicalized to `origin + pathname`; all query parameters and fragments are discarded. Main-frame redirects to a different origin are blocked.
+
 On the local fixture, Studio visibly demonstrates the complete milestone: redacted capture, mock compilation, `Draft → Validated → Approved → Promoted`, structural preflight, and promoted execution on variants A and B. Redaction counts, the structural SHA-256, planned actions, preflight result, and zero-call runtime telemetry remain visible. `Revoked` is also exposed and immediately closes promoted execution.
 
 The Studio is a first professional MVP: lifecycle orchestration is in memory for this milestone, while durable approval records and authorized clinical browser integration remain future work. Ed25519 signing is deferred; promoted artifacts use verified SHA-256.

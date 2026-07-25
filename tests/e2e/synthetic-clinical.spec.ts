@@ -205,6 +205,48 @@ test("profile selection never contacts NCBA and compilation is attestation-gated
   await expect(page.getByRole("button", { name: "Compile" })).toBeDisabled();
   expect(ncbaRequests).toEqual([]);
 
+  const dynamicTrainingUrl =
+    "https://dpi-ncba.gbna-sante.fr/saisie/consultations.cgi?patient_id=FAKE-E2E&mytime=123456";
+  await page.getByLabel("Target Website URL").fill(dynamicTrainingUrl);
+  await page.getByLabel("Target Website URL").press("Tab");
+  await expect(page.locator("#targetValidation")).toContainText(
+    "Target accepted: https://dpi-ncba.gbna-sante.fr/saisie/consultations.cgi",
+  );
+  await expect(page.locator("#targetValidation")).not.toContainText(
+    "patient_id",
+  );
+  await expect(
+    page.getByRole("button", { name: "Open in managed browser" }),
+  ).toBeDisabled();
+  for (const checkbox of await page
+    .locator("[data-attestation-key], #indicatorVerified")
+    .all()) {
+    await checkbox.check();
+  }
+  await expect(
+    page.getByRole("button", { name: "Open in managed browser" }),
+  ).toBeEnabled();
+  expect(ncbaRequests).toEqual([]);
+
+  const localValidation = await page.request.post(
+    "http://127.0.0.1:3100/api/target/validate",
+    {
+      data: {
+        studioProfileId: "ncba-dpi-training",
+        targetUrl: dynamicTrainingUrl,
+      },
+    },
+  );
+  expect(localValidation.status()).toBe(200);
+  const localValidationBody = await localValidation.json();
+  expect(localValidationBody).toEqual({
+    accepted: true,
+    origin: "https://dpi-ncba.gbna-sante.fr",
+    canonicalUrl: "https://dpi-ncba.gbna-sante.fr/saisie/consultations.cgi",
+    queryParametersDiscarded: true,
+  });
+  expect(JSON.stringify(localValidationBody)).not.toContain("FAKE-E2E");
+
   const missingAttestation = await page.request.post(
     "http://127.0.0.1:3100/api/compile",
     {
@@ -228,6 +270,22 @@ test("profile selection never contacts NCBA and compilation is attestation-gated
     },
   );
   expect(noExplicitOpen.status()).toBe(400);
+
+  const missingOpenAttestation = await page.request.post(
+    "http://127.0.0.1:3100/api/managed-browser/open",
+    {
+      data: {
+        studioProfileId: "ncba-dpi-training",
+        targetUrl: dynamicTrainingUrl,
+        explicitUserAction: true,
+      },
+    },
+  );
+  expect(missingOpenAttestation.status()).toBe(403);
+  expect(await missingOpenAttestation.json()).toMatchObject({
+    error: expect.stringContaining("attestation"),
+  });
+  expect(ncbaRequests).toEqual([]);
 
   const completeAttestation = await page.request.post(
     "http://127.0.0.1:3100/api/compile",

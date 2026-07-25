@@ -47,6 +47,7 @@ import {
   DEFAULT_INSTRUCTION,
   WORKFLOW_PATH,
   WORKFLOW_STORAGE_DIR,
+  canonicalizeTargetUrl,
 } from "@visual-compiler/shared";
 
 const port = Number(process.env.STUDIO_PORT ?? 3000);
@@ -226,10 +227,14 @@ function isOpenAIHost(hostname: string) {
 }
 
 async function openManagedBrowser(profileId: StudioProfileId, target: URL) {
+  const allowedNavigationOrigin = new URL(target).origin;
   const existing = managedContexts.get(profileId);
   if (existing) {
     const page = existing.pages()[0] ?? (await existing.newPage());
     await page.goto(target.toString());
+    if (new URL(page.url()).origin !== allowedNavigationOrigin) {
+      throw new Error("Cross-origin navigation was blocked.");
+    }
     await page.bringToFront();
     return;
   }
@@ -242,7 +247,15 @@ async function openManagedBrowser(profileId: StudioProfileId, target: URL) {
   managedContexts.set(profileId, context);
   context.on("close", () => managedContexts.delete(profileId));
   await context.route("**/*", async (route) => {
-    if (isOpenAIHost(new URL(route.request().url()).hostname)) {
+    const requestUrl = new URL(route.request().url());
+    if (isOpenAIHost(requestUrl.hostname)) {
+      await route.abort("blockedbyclient");
+      return;
+    }
+    if (
+      route.request().isNavigationRequest() &&
+      requestUrl.origin !== allowedNavigationOrigin
+    ) {
       await route.abort("blockedbyclient");
       return;
     }
@@ -258,6 +271,9 @@ async function openManagedBrowser(profileId: StudioProfileId, target: URL) {
   );
   const page = context.pages()[0] ?? (await context.newPage());
   await page.goto(target.toString());
+  if (new URL(page.url()).origin !== allowedNavigationOrigin) {
+    throw new Error("Cross-origin navigation was blocked.");
+  }
 }
 
 function workflowArtifactPath(workflowId: string) {
@@ -405,7 +421,8 @@ function studioHtml() {
         <label class="field" id="targetUrlField" for="targetUrl">Target Website URL
           <input id="targetUrl" type="url" autocomplete="off">
         </label>
-        <button type="button" id="openManagedBrowser">Open in managed browser</button>
+        <button type="button" id="openManagedBrowser" disabled>Open in managed browser</button>
+        <p class="hint warn" id="targetValidation" aria-live="polite">Validating configured target locally…</p>
         <p class="hint" id="openPolicy">Selecting a profile never opens its URL. Opening requires this explicit action.</p>
         <div class="attestation" id="syntheticAttestation" aria-label="Synthetic data attestation">
           <strong>I confirm that:</strong>
@@ -515,7 +532,8 @@ OpenAI requests: 0</pre>
       profile: studioProfiles[0],
       capture: null,
       lifecycle: null,
-      preflight: null
+      preflight: null,
+      targetValid: false
     };
     const output = document.getElementById("output");
     const workflowSelect = document.getElementById("workflow");
@@ -526,6 +544,7 @@ OpenAI requests: 0</pre>
     const attestationInputs = Array.from(document.querySelectorAll("[data-attestation-key]"));
     const indicatorVerified = document.getElementById("indicatorVerified");
     const controls = Array.from(document.querySelectorAll("button, select, input, textarea"));
+    let targetValidationTimer;
     const variantUrl = variant => publicDemoUrl + "/demo?variant=" + variant;
     const lifecycleOrder = ["Draft", "Validated", "Approved", "Promoted", "Revoked"];
     const attestationComplete = () =>
@@ -534,14 +553,19 @@ OpenAI requests: 0</pre>
       const fixture = state.profile.id === "ncba-dpi-fixture";
       const attested = attestationComplete();
       const lifecycleState = state.lifecycle?.state;
+      document.getElementById("openManagedBrowser").disabled =
+        !state.targetValid ||
+        (state.profile.syntheticAttestationRequired && !attested);
       captureButton.disabled =
         state.profile.mode === "clinical" ||
         !state.profile.captureAllowed ||
-        !attested;
+        !attested ||
+        !state.targetValid;
       compileButton.disabled =
         state.profile.mode === "clinical" ||
         !state.profile.compilationAllowed ||
         !attested ||
+        !state.targetValid ||
         !state.capture;
       document.getElementById("runA").disabled = !fixture;
       document.getElementById("runB").disabled = !fixture;
@@ -594,6 +618,31 @@ OpenAI requests: 0</pre>
       document.getElementById("fingerprintReport").textContent = "Capture required.";
       syncJourneyControls();
     };
+    const validateTargetInput = async () => {
+      state.targetValid = false;
+      const validation = document.getElementById("targetValidation");
+      validation.textContent = "Validating target locally — no navigation performed…";
+      validation.className = "hint warn";
+      syncJourneyControls();
+      try {
+        const result = await requestJson("/api/target/validate", {
+          studioProfileId: state.profile.id,
+          targetUrl: targetUrl.value
+        });
+        state.targetValid = result.accepted === true;
+        validation.textContent =
+          "Target accepted: " + result.canonicalUrl +
+          (result.queryParametersDiscarded
+            ? " — query parameters will remain memory-only and will be removed from logs and artifacts."
+            : " — no query parameters.");
+        validation.className = "hint ok";
+      } catch {
+        validation.textContent = "Target rejected by the active Application Profile.";
+        validation.className = "hint error";
+      } finally {
+        syncJourneyControls();
+      }
+    };
     const renderLifecycle = () => {
       const current = state.lifecycle?.state;
       const currentIndex = lifecycleOrder.indexOf(current);
@@ -623,6 +672,7 @@ OpenAI requests: 0</pre>
       document.getElementById("profileWarning").textContent = profile.warning;
       targetUrl.value = profile.defaultUrl;
       targetUrl.readOnly = !profile.urlEditable;
+      state.targetValid = false;
       document.getElementById("syntheticAttestation").classList.toggle("hidden", !profile.syntheticAttestationRequired);
       document.getElementById("trainingControls").classList.toggle("hidden", profile.mode === "clinical");
       document.getElementById("fixtureLifecyclePanel").classList.toggle("hidden", profile.id !== "ncba-dpi-fixture");
@@ -640,6 +690,7 @@ OpenAI requests: 0</pre>
       }
       setStatus(profile.mode === "clinical" ? "Clinical execution-only profile" : "Training profile selected");
       renderLifecycle();
+      validateTargetInput();
     };
     const showWorkflowMetrics = workflow => {
       document.getElementById("compileCalls").textContent = workflow.diagnostics.modelCalls;
@@ -917,7 +968,8 @@ OpenAI requests: 0</pre>
         const result = await requestJson("/api/managed-browser/open", {
           studioProfileId: state.profile.id,
           targetUrl: targetUrl.value,
-          explicitUserAction: true
+          explicitUserAction: true,
+          syntheticAttestation: syntheticAttestation()
         });
         setStatus(result.status, "ok");
       } catch (error) {
@@ -930,6 +982,16 @@ OpenAI requests: 0</pre>
     [...attestationInputs, indicatorVerified].forEach(input => {
       input.addEventListener("change", syncJourneyControls);
     });
+    targetUrl.addEventListener("input", () => {
+      state.targetValid = false;
+      document.getElementById("targetValidation").textContent =
+        "Target changed — local validation required.";
+      document.getElementById("targetValidation").className = "hint warn";
+      syncJourneyControls();
+      window.clearTimeout(targetValidationTimer);
+      targetValidationTimer = window.setTimeout(validateTargetInput, 250);
+    });
+    targetUrl.addEventListener("change", validateTargetInput);
     document.getElementById("approvalConfirmation").addEventListener("change", syncJourneyControls);
     document.getElementById("preflightConfirmation").addEventListener("change", syncJourneyControls);
     document.getElementById("clinicalConfirmation").addEventListener("change", syncJourneyControls);
@@ -1015,6 +1077,34 @@ app.get("/health", async (_req, res) => {
 app.get("/api/application-profiles", (_req, res) => {
   res.json({ profiles: studioProfiles });
 });
+app.post("/api/target/validate", (req, res) => {
+  const parsedProfileId = StudioProfileIdSchema.safeParse(
+    req.body.studioProfileId,
+  );
+  if (!parsedProfileId.success) {
+    res.status(400).json({ error: "Unknown Studio application profile." });
+    return;
+  }
+  try {
+    const resolved = resolveStudioProfileTarget({
+      profileId: parsedProfileId.data,
+      targetUrl: String(req.body.targetUrl ?? ""),
+      purpose: "open",
+      fixtureOrigin: publicDemoUrl,
+    });
+    res.json({
+      accepted: true,
+      origin: resolved.url.origin,
+      canonicalUrl: canonicalizeTargetUrl(resolved.url),
+      queryParametersDiscarded: resolved.url.search.length > 0,
+    });
+  } catch {
+    res.status(400).json({
+      accepted: false,
+      error: "Target URL is not allowed by the active Application Profile.",
+    });
+  }
+});
 app.post("/api/managed-browser/open", async (req, res) => {
   if (req.body.explicitUserAction !== true) {
     res.status(400).json({
@@ -1036,16 +1126,31 @@ app.post("/api/managed-browser/open", async (req, res) => {
       purpose: "open",
       fixtureOrigin: publicDemoUrl,
     });
+    if (resolved.profile.syntheticAttestationRequired) {
+      try {
+        requireValidAttestation(
+          req.body.syntheticAttestation,
+          resolved.applicationProfile,
+        );
+      } catch {
+        res.status(403).json({
+          error:
+            "Managed browser opening requires a fresh synthetic-environment attestation.",
+        });
+        return;
+      }
+    }
     await openManagedBrowser(parsedProfileId.data, resolved.url);
     res.json({
       status: "Managed browser opened by explicit user action",
       profileId: resolved.profile.id,
       mode: resolved.profile.mode,
     });
-  } catch (error) {
-    res
-      .status(400)
-      .json({ error: error instanceof Error ? error.message : String(error) });
+  } catch {
+    res.status(400).json({
+      error:
+        "Managed browser navigation failed or was blocked by the origin policy.",
+    });
   }
 });
 app.delete("/api/browser-profiles/:profileId", async (req, res) => {
@@ -1243,11 +1348,15 @@ app.post("/api/compile", async (req, res) => {
       });
       return;
     }
+    const compilerPageModel: PageModel = {
+      ...capture.pageModel,
+      url: canonicalizeTargetUrl(capture.pageModel.url),
+    };
     const workflow = await compileWorkflow({
       instruction,
-      url: capture.pageModel.url,
+      url: compilerPageModel.url,
       outDir: WORKFLOW_STORAGE_DIR,
-      pageModel: capture.pageModel,
+      pageModel: compilerPageModel,
     });
     const lifecycle: LifecycleRecord = {
       workflow,

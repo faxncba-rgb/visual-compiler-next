@@ -3,7 +3,10 @@ import { zodTextFormat } from "openai/helpers/zod";
 import { z } from "zod";
 import type { PageModel } from "@visual-compiler/page-model";
 import { SemanticStepSchema } from "@visual-compiler/semantic-ir";
-import { DEFAULT_INSTRUCTION } from "@visual-compiler/shared";
+import {
+  canonicalizeTargetUrl,
+  DEFAULT_INSTRUCTION,
+} from "@visual-compiler/shared";
 
 export const InterpreterResponseSchema = z.object({
   name: z.string(),
@@ -19,7 +22,7 @@ export const InterpreterResponseSchema = z.object({
 export type InterpreterResponse = z.infer<typeof InterpreterResponseSchema>;
 
 export function createRedactedCompilerPageModel(model: PageModel) {
-  const url = new URL(model.url);
+  const url = new URL(canonicalizeTargetUrl(model.url));
   return {
     origin: url.origin,
     path: url.pathname,

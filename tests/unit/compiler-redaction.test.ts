@@ -1,7 +1,11 @@
 import { describe, expect, it } from "vitest";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import {
   compileWorkflow,
   createRedactedCompilerPageModel,
+  mockInterpretInstruction,
 } from "@visual-compiler/compiler";
 import type { PageModel } from "@visual-compiler/page-model";
 import { DEFAULT_INSTRUCTION } from "@visual-compiler/shared";
@@ -9,7 +13,7 @@ import { DEFAULT_INSTRUCTION } from "@visual-compiler/shared";
 describe("compiler privacy boundary", () => {
   it("passes only structural fields and explicitly stable labels to the model boundary", () => {
     const model: PageModel = {
-      url: "https://dpi-ncba.gbna-sante.fr/queue?patient=PRIVATE",
+      url: "https://dpi-ncba.gbna-sante.fr/saisie/consultations.cgi?patient_id=PRIVATE&mytime=PRIVATE-TIME",
       viewport: { width: 800, height: 600 },
       capturedAt: new Date().toISOString(),
       nodes: [
@@ -34,6 +38,12 @@ describe("compiler privacy boundary", () => {
     expect(serialized).not.toContain("PRIVATE");
     expect(serialized).not.toContain("generated-private-id");
     expect(serialized).not.toContain("patient=");
+    expect(serialized).not.toContain("patient_id");
+    expect(serialized).not.toContain("mytime");
+    expect(redacted).toMatchObject({
+      origin: "https://dpi-ncba.gbna-sante.fr",
+      path: "/saisie/consultations.cgi",
+    });
     expect(serialized).toContain("administrative-search");
     expect(redacted.redactionReport).toMatchObject({
       cookiesCaptured: false,
@@ -44,7 +54,7 @@ describe("compiler privacy boundary", () => {
 
   it("compiles from an already-open managed page model without navigating", async () => {
     const model: PageModel = {
-      url: "https://dpi-ncba.gbna-sante.fr/training",
+      url: "https://dpi-ncba.gbna-sante.fr/saisie/consultations.cgi?patient_id=FAKE-A&mytime=111",
       viewport: { width: 800, height: 600 },
       capturedAt: new Date().toISOString(),
       nodes: [
@@ -94,15 +104,50 @@ describe("compiler privacy boundary", () => {
         },
       ],
     };
-    const workflow = await compileWorkflow({
-      instruction: DEFAULT_INSTRUCTION,
-      url: "https://dpi-ncba.gbna-sante.fr/training",
-      pageModel: model,
-    });
-    expect(workflow.source.url).toBe("https://dpi-ncba.gbna-sante.fr/training");
-    expect(workflow.diagnostics).toMatchObject({
-      interpretationSource: "mock",
-      modelCalls: 0,
-    });
+    const directory = await mkdtemp(path.join(tmpdir(), "vc-canonical-"));
+    try {
+      const workflow = await compileWorkflow({
+        instruction: DEFAULT_INSTRUCTION,
+        url: "https://dpi-ncba.gbna-sante.fr/saisie/consultations.cgi?patient_id=FAKE-A&mytime=111",
+        pageModel: model,
+        outDir: directory,
+        interpreter: async (instruction, compilerModel) => {
+          expect(compilerModel.url).toBe(
+            "https://dpi-ncba.gbna-sante.fr/saisie/consultations.cgi",
+          );
+          expect(compilerModel.url).not.toContain("patient_id");
+          expect(compilerModel.url).not.toContain("mytime");
+          return {
+            result: mockInterpretInstruction(instruction),
+            responseModel: undefined,
+            tokenUsage: undefined,
+            source: "mock" as const,
+            modelCalls: 0,
+          };
+        },
+      });
+      const serializedWorkflow = JSON.stringify(workflow);
+      const storedArtifact = await readFile(
+        path.join(directory, `${workflow.id}.json`),
+        "utf8",
+      );
+      expect(workflow.source.url).toBe(
+        "https://dpi-ncba.gbna-sante.fr/saisie/consultations.cgi",
+      );
+      expect(workflow.metadata.targetUrl).toBe(
+        "https://dpi-ncba.gbna-sante.fr/saisie/consultations.cgi",
+      );
+      for (const serialized of [serializedWorkflow, storedArtifact]) {
+        expect(serialized).not.toContain("patient_id");
+        expect(serialized).not.toContain("mytime");
+        expect(serialized).not.toContain("FAKE-A");
+      }
+      expect(workflow.diagnostics).toMatchObject({
+        interpretationSource: "mock",
+        modelCalls: 0,
+      });
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
   });
 });

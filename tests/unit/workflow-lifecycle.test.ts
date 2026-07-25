@@ -109,7 +109,7 @@ describe("workflow lifecycle and clinical preflight", () => {
     expect(parameters).toEqual({});
     const audit = createRedactedAudit({
       workflow: promoted,
-      origin: "http://127.0.0.1:4173/ncba-fixture?secret=x",
+      origin: "http://127.0.0.1:4173/ncba-fixture?patient_id=FAKE-A&mytime=111",
       structuralCompatibility: 1,
       startTime: "2026-07-22T10:00:00.000Z",
       endTime: "2026-07-22T10:00:01.000Z",
@@ -119,8 +119,12 @@ describe("workflow lifecycle and clinical preflight", () => {
       errors: [new Error("PRIVATE")],
     });
     expect(JSON.stringify(audit)).not.toContain("PRIVATE");
+    expect(JSON.stringify(audit)).not.toContain("patient_id");
+    expect(JSON.stringify(audit)).not.toContain("mytime");
+    expect(JSON.stringify(audit)).not.toContain("FAKE-A");
     expect(audit).toMatchObject({
       origin: "http://127.0.0.1:4173",
+      targetUrl: "http://127.0.0.1:4173/ncba-fixture",
       llmCalls: 0,
       openAIRequests: 0,
     });

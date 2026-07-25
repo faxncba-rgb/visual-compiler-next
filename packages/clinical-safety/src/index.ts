@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { appendFile, chmod, mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
 import { z } from "zod";
+import { canonicalizeTargetUrl } from "@visual-compiler/shared";
 
 export const WorkflowActionSchema = z.enum([
   "click",
@@ -211,6 +212,7 @@ const forbiddenProtocols = new Set([
   "file:",
   "data:",
   "javascript:",
+  "blob:",
   "chrome:",
   "chrome-extension:",
 ]);
@@ -278,7 +280,11 @@ export function validateTargetUrl(raw: string, options: SafeUrlOptions) {
     options.mode === "training"
       ? options.profile.trainingOrigins
       : options.profile.runtimeOrigins;
-  if (!allowedOrigins.includes(url.origin))
+  const targetOrigin = new URL(url).origin;
+  const configuredOrigins = new Set(
+    allowedOrigins.map((allowedOrigin) => new URL(allowedOrigin).origin),
+  );
+  if (!configuredOrigins.has(targetOrigin))
     throw new Error("Target origin is not allowed by the Application Profile.");
   if (
     !options.profile.allowedPaths.some((prefix) =>
@@ -296,7 +302,7 @@ export function validateRedirect(
   options: SafeUrlOptions,
 ) {
   const to = validateTargetUrl(new URL(toRaw, from).toString(), options);
-  if (to.origin !== from.origin)
+  if (new URL(to).origin !== new URL(from).origin)
     throw new Error("Cross-origin redirects are forbidden.");
   return to;
 }
@@ -397,7 +403,7 @@ export function redactPageModel(input: {
   url: string;
   nodes: RawPageNode[];
 }): RedactedPageModel {
-  const url = new URL(input.url);
+  const url = new URL(canonicalizeTargetUrl(input.url));
   let fieldsRemoved = 0;
   let valuesRemoved = 0;
   let sensitiveNodesRemoved = 0;
@@ -669,12 +675,14 @@ export function createRedactedAudit(input: {
   stepResults: string[];
   errors?: unknown[];
 }) {
+  const canonicalTargetUrl = canonicalizeTargetUrl(input.origin);
   return {
     workflowId: input.workflow.workflowId,
     workflowVersion: input.workflow.workflowVersion,
     workflowHash: input.workflow.workflowSha256,
     applicationProfileId: input.workflow.applicationProfileId,
-    origin: new URL(input.origin).origin,
+    origin: new URL(canonicalTargetUrl).origin,
+    targetUrl: canonicalTargetUrl,
     structuralCompatibility: input.structuralCompatibility,
     startTime: input.startTime,
     endTime: input.endTime,

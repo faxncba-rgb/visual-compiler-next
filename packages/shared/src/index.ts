@@ -23,3 +23,8 @@ export const WORKFLOW_PATH = path.join(
 );
 
 export const nowIso = () => new Date().toISOString();
+
+export function canonicalizeTargetUrl(target: string | URL) {
+  const url = target instanceof URL ? target : new URL(target);
+  return `${url.origin}${url.pathname}`;
+}

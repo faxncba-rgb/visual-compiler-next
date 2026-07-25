@@ -7,6 +7,8 @@
 - Enforced fresh synthetic-data attestation before capture or compilation and technical clinical compilation/capture denial.
 - Added the visible fixture lifecycle journey from redacted capture through promoted A/B execution, including redaction, fingerprint, preflight, and zero-call telemetry panels.
 - Added fixture-only tests proving profile selection makes no NCBA request.
+- Allowed dynamic same-origin NCBA training paths and query parameters while canonicalizing compiler, artifact, fingerprint, and audit URLs to `origin + pathname`.
+- Added attestation-gated managed-browser opening, local target validation, and Playwright cross-origin navigation blocking.
 
 ## 0.2.0 — 2026-07-22
 

@@ -11,6 +11,7 @@ import {
   validateRedirect,
   validateTargetUrl,
 } from "@visual-compiler/clinical-safety";
+import { canonicalizeTargetUrl } from "@visual-compiler/shared";
 
 const completeAttestation = (attestedAt = new Date().toISOString()) => ({
   profileId: "ncba-dpi",
@@ -93,10 +94,55 @@ describe("Application Profiles and safe URL mode", () => {
     ).toBe("/ncba-fixture");
   });
 
+  it("allows dynamic same-origin training paths while canonicalizing away parameters", () => {
+    const targets = [
+      "https://dpi-ncba.gbna-sante.fr/saisie/consultations.cgi?patient_id=FAKE-A&mytime=111",
+      "https://dpi-ncba.gbna-sante.fr/saisie/consultations.cgi?patient_id=FAKE-B&mytime=222",
+    ];
+    const resolved = targets.map(
+      (target) =>
+        resolveStudioProfileTarget({
+          profileId: "ncba-dpi-training",
+          targetUrl: target,
+          purpose: "open",
+        }).url,
+    );
+    expect(resolved.map((url) => url.toString())).toEqual(targets);
+    expect(resolved.map(canonicalizeTargetUrl)).toEqual([
+      "https://dpi-ncba.gbna-sante.fr/saisie/consultations.cgi",
+      "https://dpi-ncba.gbna-sante.fr/saisie/consultations.cgi",
+    ]);
+  });
+
+  it("rejects insecure, sibling-subdomain, and cross-origin redirects", () => {
+    expect(() =>
+      validateTargetUrl(
+        "http://dpi-ncba.gbna-sante.fr/saisie/consultations.cgi",
+        { mode: "training", profile: ncbaDpiProfile },
+      ),
+    ).toThrow(/HTTPS/);
+    expect(() =>
+      validateTargetUrl(
+        "https://other.dpi-ncba.gbna-sante.fr/saisie/consultations.cgi",
+        { mode: "training", profile: ncbaDpiProfile },
+      ),
+    ).toThrow(/origin/);
+    expect(() =>
+      validateRedirect(
+        new URL(
+          "https://dpi-ncba.gbna-sante.fr/saisie/consultations.cgi?patient_id=FAKE",
+        ),
+        "https://outside.invalid/redirect",
+        { mode: "training", profile: ncbaDpiProfile },
+      ),
+    ).toThrow(/origin|Cross-origin/);
+  });
+
   it.each([
     "file:///tmp/a",
     "data:text/plain,a",
     "javascript:alert(1)",
+    "blob:https://dpi-ncba.gbna-sante.fr/fake",
     "chrome://settings",
   ])("rejects forbidden protocol %s", (target) => {
     expect(() =>

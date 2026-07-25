@@ -1,5 +1,14 @@
 # Progress
 
+## 2026-07-25 — Dynamic training URLs with canonical privacy boundary
+
+- NCBA training target validation now compares the exact HTTPS origin and accepts dynamic paths and query parameters on that origin.
+- Studio validates the target locally, displays the canonical URL, and enables managed-browser opening only after complete synthetic attestation.
+- Full target URLs remain memory-only; compiler inputs, workflow artifacts, fingerprints, and audits contain only `origin + pathname`.
+- Managed Playwright navigation blocks redirects to any other origin while retaining runtime OpenAI blocking.
+- Tests use fictitious parameter values and local fixtures only; no NCBA or OpenAI request is performed.
+- Validation: clean install, build, 41/41 unit and integration tests, 8/8 focused security tests with a 75-file scan, and 10/10 Playwright E2E tests.
+
 ## 2026-07-24 — Visible managed application profiles
 
 - Added Studio selection and active-mode display for `ncba-dpi-fixture`, `ncba-dpi-training`, and `ncba-dpi-clinical`.

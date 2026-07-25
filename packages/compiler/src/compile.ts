@@ -12,7 +12,7 @@ import {
   type SemanticStep,
   type SemanticWorkflow,
 } from "@visual-compiler/semantic-ir";
-import { nowIso } from "@visual-compiler/shared";
+import { canonicalizeTargetUrl, nowIso } from "@visual-compiler/shared";
 import { generatePlaywrightSource } from "./codegen.js";
 import { interpretInstruction } from "./interpreter.js";
 
@@ -70,13 +70,21 @@ export async function compileWorkflow(
       await browser.close();
     }
   }
+  const canonicalUrl = canonicalizeTargetUrl(pageModel.url);
+  const compilerPageModel: PageModel = {
+    ...pageModel,
+    url: canonicalUrl,
+  };
 
   const interpretation = await (options.interpreter ?? interpretInstruction)(
     options.instruction,
-    pageModel,
+    compilerPageModel,
   );
   const steps = interpretation.result.steps.map((step) => {
-    const candidates = generateCandidates(pageModel, step as SemanticStep);
+    const candidates = generateCandidates(
+      compilerPageModel,
+      step as SemanticStep,
+    );
     const selected = selectBestCandidate(candidates);
     return {
       ...step,
@@ -122,15 +130,15 @@ export async function compileWorkflow(
     id: identity.id,
     version: "0.1.0",
     name: identity.name,
-    source: { url: options.url, viewport: pageModel.viewport },
+    source: { url: canonicalUrl, viewport: compilerPageModel.viewport },
     steps,
     compiledAt: nowIso(),
     compileModel: process.env.OPENAI_COMPILE_MODEL ?? "gpt-5.6",
     metadata: {
       compilerVersion: "0.1.0",
-      targetUrl: options.url,
+      targetUrl: canonicalUrl,
       validationVariant:
-        new URL(options.url).searchParams.get("variant") ?? undefined,
+        new URL(canonicalUrl).searchParams.get("variant") ?? undefined,
     },
     diagnostics: {
       modelCalls: interpretation.modelCalls,

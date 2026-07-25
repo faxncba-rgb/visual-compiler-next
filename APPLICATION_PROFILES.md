@@ -15,3 +15,5 @@ Studio exposes exactly three managed selections:
 - `ncba-dpi-clinical`: the same configured origin in an independent clinical context, execution only, capture and compilation technically forbidden.
 
 Changing the selection updates labels and URL fields only. It performs no navigation or background request. The NCBA origin is opened only by the explicit **Open in managed browser** action and confirmation.
+
+For `ncba-dpi-training`, allowlisting compares `new URL(target).origin` with the configured origin. HTTPS path and query changes on that exact origin are accepted, while sibling subdomains, HTTP, credential-bearing URLs, forbidden schemes, and cross-origin redirects remain rejected. Query strings are memory-only and are removed before compiler input, artifacts, fingerprints, and audits.

@@ -6,6 +6,7 @@
     ".": "./src/index.ts"
   },
   "dependencies": {
+    "@visual-compiler/shared": "0.1.0",
     "zod": "^4.1.13"
   }
 }
