@@ -8,6 +8,7 @@ test-results/
 .env.production
 .DS_Store
 compiled-workflows/*.tmp.json
+compiled-workflows/.state/
 
 # Browser profiles always live outside the repository. These defensive entries
 # prevent accidental inclusion if a local path is misconfigured.

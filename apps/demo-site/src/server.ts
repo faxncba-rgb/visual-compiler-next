@@ -39,6 +39,12 @@ export function createDemoServer(
       `${syntheticAuthOrigin}/login?return_to=${encodeURIComponent(returnTo)}&bootstrap_token=SYNTHETIC-BOOTSTRAP-TOKEN`,
     );
   });
+  app.get("/sso-cgi/start", (_req, res) => {
+    const returnTo = `http://127.0.0.1:${port}/cgi-professional?session_token=SYNTHETIC-RETURN-TOKEN`;
+    res.redirect(
+      `${syntheticAuthOrigin}/login?return_to=${encodeURIComponent(returnTo)}&bootstrap_token=SYNTHETIC-BOOTSTRAP-TOKEN`,
+    );
+  });
   app.get("/sso-app/callback", (_req, res) => {
     const crossOriginFrame = `${syntheticAuthOrigin}/frame?frame_token=SYNTHETIC-FRAME-TOKEN`;
     res

@@ -1,5 +1,14 @@
 # Changelog
 
+## 2026-07-25 — Locked Training-page execution
+
+- Added fail-closed preflight and deterministic execution on the existing
+  application-locked managed Playwright page.
+- Added visible planned actions, selected locators, explicit synthetic-record
+  confirmation, redacted step telemetry, and Draft-to-Validated transition.
+- Added loopback CGI/SSO E2E coverage for session, origin, pathname, locator,
+  postcondition, first-error-stop, and zero-OpenAI guarantees.
+
 ## Unreleased
 
 - Added visible fixture, NCBA training, and NCBA clinical profile selection in Studio.

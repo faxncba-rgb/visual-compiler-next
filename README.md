@@ -55,6 +55,8 @@ On the local fixture, Studio visibly demonstrates the complete milestone: redact
 
 Draft and subsequent lifecycle state are persisted locally in restricted sidecars containing hashes, canonical URLs, structural fingerprints, profile identifiers, and timestamps but no browser or medical data. Studio restores validated sidecars on restart and can rebind a compatible artifact to a fresh confirmed capture without GPT. Artifact bytes remain immutable and are loaded separately through `GET /api/workflow`; the compile POST returns only identifiers, lifecycle state, and summarized diagnostics. Ed25519 signing is deferred; promoted artifacts use verified SHA-256.
 
+For an authorized synthetic Training session, a restored Draft can be tested directly on the already open `APPLICATION LOCKED` page. Studio first displays the workflow-provided values, selected locators, and a fail-closed local preflight. The separate **Test run on locked Training page** control requires explicit confirmation, performs no retry, never launches another browser, and may transition only `Draft → Validated`. It never approves or promotes automatically. Run A/B remain local Build Week fixture replays and must not be used for the managed Training page.
+
 ## Local use
 
 ```bash

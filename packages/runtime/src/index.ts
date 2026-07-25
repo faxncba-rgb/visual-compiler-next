@@ -1,5 +1,9 @@
 import { readFile } from "node:fs/promises";
-import { chromium, type Locator, type Page } from "playwright";
+import {
+  chromium,
+  type Locator,
+  type Page,
+} from "playwright";
 import {
   SemanticWorkflowSchema,
   type SemanticStep,
@@ -30,6 +34,181 @@ type RuntimeExecutionOptions = {
 export function isOpenAIHostname(hostname: string) {
   const normalized = hostname.toLowerCase().replace(/\.$/, "");
   return normalized === "openai.com" || normalized.endsWith(".openai.com");
+}
+
+export type ExistingPageLocatorEvidence = {
+  stepId: string;
+  selectedLocator: string;
+  strategy: "role-name" | "role-ordinal" | "text" | "semantic-rule";
+  matchCount: number;
+  unique: true;
+};
+
+export type ExistingPagePlannedAction = {
+  stepId: string;
+  action: SemanticStep["action"];
+  target: string;
+  selectedLocator: string;
+  value?: string;
+  locator: ExistingPageLocatorEvidence;
+  preconditionsPassed: true;
+};
+
+export type ExistingPageTelemetry = {
+  startedAt: string;
+  finishedAt: string;
+  durationMs: number;
+  llmCalls: 0;
+  openAIRequests: 0;
+  steps: Array<{
+    stepId: string;
+    action: SemanticStep["action"];
+    status: "passed" | "failed";
+    durationMs: number;
+  }>;
+};
+
+type ResolvedExistingPageLocator = {
+  locator: Locator;
+  evidence: ExistingPageLocatorEvidence;
+};
+type PlaywrightAriaRole = Parameters<Page["getByRole"]>[0];
+
+function selectedLocatorLabel(step: SemanticStep) {
+  return (
+    step.target.accessibleName ??
+    step.selectedLocator?.rule?.candidateText ??
+    step.selectedLocator?.primary ??
+    step.intent
+  );
+}
+
+async function filterEligibleLocators(
+  candidates: Locator,
+  visibleOnly: boolean,
+  enabledOnly: boolean,
+) {
+  const eligible: number[] = [];
+  for (let index = 0; index < (await candidates.count()); index += 1) {
+    const candidate = candidates.nth(index);
+    if (visibleOnly && !(await candidate.isVisible())) continue;
+    if (enabledOnly && !(await candidate.isEnabled())) continue;
+    eligible.push(index);
+  }
+  return eligible;
+}
+
+async function resolveSelectedLocator(
+  page: Page,
+  step: SemanticStep,
+): Promise<ResolvedExistingPageLocator> {
+  const selected = step.selectedLocator;
+  if (!selected) {
+    throw new Error(`Step ${step.id} has no selected locator.`);
+  }
+  const visibleOnly = selected.rule?.visibleOnly ?? true;
+  const enabledOnly = selected.rule?.enabledOnly ?? true;
+  const roleName = selected.primary.match(
+    /^role=([a-z]+)\[name=(?:"([^"]+)"|'([^']+)')\]$/,
+  );
+  if (roleName) {
+    const role = roleName[1] as PlaywrightAriaRole;
+    const name = roleName[2] ?? roleName[3] ?? "";
+    const candidates = page.getByRole(role, { name, exact: true });
+    const eligible = await filterEligibleLocators(
+      candidates,
+      visibleOnly,
+      enabledOnly,
+    );
+    if (eligible.length !== 1) {
+      throw new Error(
+        `Step ${step.id} selected role/name locator matched ${eligible.length} eligible elements.`,
+      );
+    }
+    return {
+      locator: candidates.nth(eligible[0]),
+      evidence: {
+        stepId: step.id,
+        selectedLocator: selected.primary,
+        strategy: "role-name",
+        matchCount: 1,
+        unique: true,
+      },
+    };
+  }
+
+  const roleOrdinal = selected.primary.match(
+    /^role=([a-z]+)\s*>>\s*nth=(\d+)$/,
+  );
+  if (roleOrdinal) {
+    const role = roleOrdinal[1] as PlaywrightAriaRole;
+    const ordinal = Number.parseInt(roleOrdinal[2], 10);
+    const candidates = page.getByRole(role);
+    const eligible = await filterEligibleLocators(
+      candidates,
+      visibleOnly,
+      enabledOnly,
+    );
+    if (ordinal < 0 || ordinal >= eligible.length) {
+      throw new Error(
+        `Step ${step.id} selected ordinal ${ordinal} is outside ${eligible.length} eligible ${role} elements.`,
+      );
+    }
+    return {
+      locator: candidates.nth(eligible[ordinal]),
+      evidence: {
+        stepId: step.id,
+        selectedLocator: selected.primary,
+        strategy: "role-ordinal",
+        matchCount: eligible.length,
+        unique: true,
+      },
+    };
+  }
+
+  const textSelector = selected.primary.match(
+    /^([a-z][a-z0-9-]*):text-is\((?:"([^"]+)"|'([^']+)')\)$/,
+  );
+  if (textSelector) {
+    const tagName = textSelector[1];
+    const text = textSelector[2] ?? textSelector[3] ?? "";
+    const candidates = page.locator(tagName).filter({ hasText: text });
+    const eligible = await filterEligibleLocators(
+      candidates,
+      visibleOnly,
+      enabledOnly,
+    );
+    if (eligible.length !== 1) {
+      throw new Error(
+        `Step ${step.id} selected text locator matched ${eligible.length} eligible elements.`,
+      );
+    }
+    return {
+      locator: candidates.nth(eligible[0]),
+      evidence: {
+        stepId: step.id,
+        selectedLocator: selected.primary,
+        strategy: "text",
+        matchCount: 1,
+        unique: true,
+      },
+    };
+  }
+
+  const locator = await resolveSemanticLocator(page, step);
+  if ((await locator.count()) !== 1) {
+    throw new Error(`Step ${step.id} semantic locator is not unique.`);
+  }
+  return {
+    locator,
+    evidence: {
+      stepId: step.id,
+      selectedLocator: selected.primary,
+      strategy: "semantic-rule",
+      matchCount: 1,
+      unique: true,
+    },
+  };
 }
 
 async function resolveSemanticLocator(
@@ -107,8 +286,55 @@ async function resolveSemanticLocator(
   return ordered[index]?.locator ?? ordered[0].locator;
 }
 
-async function runStep(page: Page, step: SemanticStep) {
-  const target = await resolveSemanticLocator(page, step);
+async function verifyStepAssertions(
+  page: Page,
+  target: Locator,
+  assertions: SemanticStep["preconditions"],
+) {
+  for (const assertion of assertions) {
+    if (assertion.type === "text-visible") {
+      const expected = String(assertion.expected ?? assertion.target);
+      if (
+        !(await page
+          .getByText(expected, { exact: true })
+          .first()
+          .isVisible()
+          .catch(() => false))
+      ) {
+        throw new Error("A required text precondition is not visible.");
+      }
+    } else if (assertion.type === "checkbox-state") {
+      if (
+        (await target.isChecked().catch(() => false)) !==
+        Boolean(assertion.expected)
+      ) {
+        throw new Error("A required checkbox precondition failed.");
+      }
+    } else if (assertion.type === "element-visible") {
+      if ((await target.isVisible()) !== Boolean(assertion.expected ?? true)) {
+        throw new Error("A required visibility precondition failed.");
+      }
+    } else if (assertion.type === "element-enabled") {
+      if ((await target.isEnabled()) !== Boolean(assertion.expected ?? true)) {
+        throw new Error("A required enabled-state precondition failed.");
+      }
+    }
+  }
+}
+
+async function verifyStepPostconditions(
+  page: Page,
+  target: Locator,
+  step: SemanticStep,
+) {
+  await verifyStepAssertions(page, target, step.postconditions);
+}
+
+async function runStepWithTarget(
+  page: Page,
+  step: SemanticStep,
+  target: Locator,
+) {
   if (step.action === "check") await target.check();
   else if (step.action === "uncheck") await target.uncheck();
   else if (step.action === "click") await target.click();
@@ -119,22 +345,115 @@ async function runStep(page: Page, step: SemanticStep) {
   else if (step.action === "assert") await target.waitFor({ state: "visible" });
   else throw new Error(`Unsupported runtime action: ${step.action}`);
 
-  for (const assertion of step.postconditions) {
-    if (assertion.type === "text-visible") {
-      await page
-        .getByText(String(assertion.expected ?? assertion.target), {
-          exact: true,
-        })
-        .waitFor({ state: "visible" });
+  await verifyStepPostconditions(page, target, step);
+}
+
+async function runStep(page: Page, step: SemanticStep) {
+  const target = await resolveSemanticLocator(page, step);
+  await runStepWithTarget(page, step, target);
+}
+
+function assertPageOrigin(page: Page, expectedOrigin: string) {
+  const current = new URL(page.url());
+  if (current.origin !== expectedOrigin) {
+    throw new Error("The managed page left its locked application origin.");
+  }
+}
+
+export async function inspectWorkflowOnExistingPage(input: {
+  page: Page;
+  workflow: SemanticWorkflow;
+  expectedOrigin: string;
+}): Promise<ExistingPagePlannedAction[]> {
+  assertPageOrigin(input.page, input.expectedOrigin);
+  const plannedActions: ExistingPagePlannedAction[] = [];
+  for (const step of input.workflow.steps) {
+    const resolved = await resolveSelectedLocator(input.page, step);
+    await verifyStepAssertions(
+      input.page,
+      resolved.locator,
+      step.preconditions,
+    );
+    plannedActions.push({
+      stepId: step.id,
+      action: step.action,
+      target: selectedLocatorLabel(step),
+      selectedLocator: resolved.evidence.selectedLocator,
+      ...(step.value !== undefined ? { value: step.value } : {}),
+      locator: resolved.evidence,
+      preconditionsPassed: true,
+    });
+  }
+  return plannedActions;
+}
+
+export async function runWorkflowOnExistingPage(input: {
+  page: Page;
+  workflow: SemanticWorkflow;
+  expectedOrigin: string;
+}): Promise<ExistingPageTelemetry> {
+  const startedAt = new Date().toISOString();
+  const started = Date.now();
+  const steps: ExistingPageTelemetry["steps"] = [];
+  await input.page.route("**/*", async (route) => {
+    const requestUrl = new URL(route.request().url());
+    if (isOpenAIHostname(requestUrl.hostname)) {
+      await route.abort("blockedbyclient");
+      return;
     }
-    if (assertion.type === "checkbox-state") {
-      const checked = await target.isChecked();
-      if (checked !== assertion.expected)
-        throw new Error(
-          `Checkbox postcondition failed for ${assertion.target}.`,
-        );
+    const isMainNavigation =
+      route.request().isNavigationRequest() &&
+      route.request().frame() === input.page.mainFrame();
+    if (isMainNavigation && requestUrl.origin !== input.expectedOrigin) {
+      await route.abort("blockedbyclient");
+      return;
+    }
+    await route.fallback();
+  });
+  await input.page.routeWebSocket(
+    (url) => isOpenAIHostname(url.hostname),
+    (webSocket) =>
+      webSocket.close({
+        code: 1008,
+        reason: "OpenAI network access is forbidden at runtime.",
+      }),
+  );
+  assertPageOrigin(input.page, input.expectedOrigin);
+  for (const step of input.workflow.steps) {
+    const stepStarted = Date.now();
+    try {
+      const resolved = await resolveSelectedLocator(input.page, step);
+      await verifyStepAssertions(
+        input.page,
+        resolved.locator,
+        step.preconditions,
+      );
+      await runStepWithTarget(input.page, step, resolved.locator);
+      assertPageOrigin(input.page, input.expectedOrigin);
+      steps.push({
+        stepId: step.id,
+        action: step.action,
+        status: "passed",
+        durationMs: Date.now() - stepStarted,
+      });
+    } catch {
+      steps.push({
+        stepId: step.id,
+        action: step.action,
+        status: "failed",
+        durationMs: Date.now() - stepStarted,
+      });
+      break;
     }
   }
+  return {
+    startedAt,
+    finishedAt: new Date().toISOString(),
+    durationMs: Date.now() - started,
+    llmCalls: 0,
+    openAIRequests: 0,
+    steps,
+  };
 }
 
 type FinalStateCheck = NonNullable<

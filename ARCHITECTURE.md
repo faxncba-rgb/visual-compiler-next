@@ -39,6 +39,8 @@ Open in managed browser
 
 The managed browser context is ephemeral and memory-only. Route policy distinguishes primary-page navigation from iframe navigation, popup navigation, and subresources. OpenAI HTTP/WebSocket traffic is blocked in both states. Cross-origin frames may render after lock but never enter the page model.
 
+Locked Training validation is a third, explicit operation within `APPLICATION LOCKED`, not a clinical run. The runtime accepts the existing Playwright `Page` object, re-resolves the immutable selected locators, checks uniqueness/preconditions/fingerprint/origin/path, shows planned actions, and waits for a dedicated human confirmation. It executes in order with no retry and stops at the first error. A pass records redacted step telemetry and permits only the `Draft → Validated` transition.
+
 Artifacts remain exclusive and versioned. Existing files cannot be silently overwritten. SHA-256 is verified before a promoted workflow may run. Ed25519 with a private key outside the repository is the next integrity milestone.
 
 Compilation is coordinated as a recoverable local job. The POST response is a

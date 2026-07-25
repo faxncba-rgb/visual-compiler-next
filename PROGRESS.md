@@ -1,5 +1,23 @@
 # Progress
 
+## 2026-07-25 — Locked Training-page test execution
+
+- Added a distinct **Test run on locked Training page** path that reuses the already open managed Playwright `Page`; it never launches a second browser, exports authentication state, or calls a model.
+- The fail-closed Training preflight requires the `ncba-dpi-training` profile, `APPLICATION LOCKED`, a restored Draft attached to the same managed session/capture, exact configured origin, identical canonical pathname, compatible structural fingerprint, declared and live locator uniqueness, and passing preconditions.
+- Studio displays each planned action, selected locator, workflow-provided fill value, locator strategy/match count, structural compatibility, and zero-call counters before enabling a separate execution confirmation.
+- Execution is ordered, has no retry, stops on the first failure, verifies postconditions and the locked origin after every step, and emits only step id, action, pass/fail, duration, `llmCalls: 0`, and `openAIRequests: 0`.
+- A successful synthetic Training test transitions `Draft → Validated`; approval and promotion remain separate human actions.
+- Added a local CGI-through-SSO fixture route and tests for fill/click, wrong pathname, blocked cross-origin exit, changed managed session, ambiguous locator, first-error stop, and value-free telemetry.
+- The existing local GPT-5.6 artifact remained unchanged at SHA-256 `ec72a93591ae8e4a2403661818c7b65ffc59dbdd2f21c56f9bd1e23f09691474`. It was inspected only through bounded locator metadata and was not executed during development.
+- No DPI request and no OpenAI request occurred. Final validation passed:
+  build, 49/49 unit and integration tests, 9/9 focused security tests plus an
+  81-file repository scan, and 14/14 Playwright E2E tests.
+- Visual loopback verification in Studio confirmed the selected
+  `ncba-dpi-training` profile, `TRAINING` mode, manual-opening warning,
+  synthetic attestation, disabled Run A/B, the **LOCKED TRAINING TEST** panel,
+  Draft-to-Revoked lifecycle, selected-locator/action area, explicit execution
+  checkbox, **Test run on locked Training page**, and zero-call telemetry.
+
 ## 2026-07-25 — Recoverable compact compilation
 
 - Diagnosed the post-write busy state: the immutable artifact was saved before the HTTP response, while Studio remained busy until a full workflow response was transferred, parsed, listed, applied, and rendered with no timeout or recovery record.

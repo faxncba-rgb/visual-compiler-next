@@ -19,6 +19,13 @@ must remain local and untracked. Codex may inspect only bounded metadata and
 privacy-scan results, must not print the complete artifact, and must exercise
 recovery exclusively with the local large CGI fixture and `USE_LIVE_OPENAI=false`.
 
+For locked Training execution work, Codex must validate only the loopback CGI
+and synthetic SSO fixtures. It may add runtime support for an existing
+Playwright `Page`, but must not open the real DPI, execute the recovered real
+workflow, call OpenAI, export browser state, or include dynamic URLs and page
+values in telemetry. A successful Training test may validate a Draft only;
+approval and promotion remain distinct human decisions.
+
 ## Components Codex Designed
 
 - Monorepo structure separating compile-time and runtime packages.

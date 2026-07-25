@@ -25,7 +25,12 @@ import {
 } from "@visual-compiler/compiler";
 import { extractPageModel, type PageModel } from "@visual-compiler/page-model";
 import { generateCandidates } from "@visual-compiler/locator-engine";
-import { runCompiledWorkflow } from "@visual-compiler/runtime";
+import {
+  inspectWorkflowOnExistingPage,
+  runCompiledWorkflow,
+  runWorkflowOnExistingPage,
+  type ExistingPagePlannedAction,
+} from "@visual-compiler/runtime";
 import {
   createStudioApplicationProfiles,
   clinicalPreflight,
@@ -197,12 +202,34 @@ type LifecycleRecord = {
   validation?: {
     passed: boolean;
     variants: Array<{ variant: "A" | "B"; passed: boolean }>;
+    trainingTest?: {
+      passed: boolean;
+      validatedAt: string;
+      stepIds: string[];
+      llmCalls: 0;
+      openAIRequests: 0;
+    };
   };
   approvalTimestamp?: string;
   promotion?: PromotedWorkflow;
   lastPreflight?: ReturnType<typeof clinicalPreflight>;
 };
 const lifecycleRecords = new Map<string, LifecycleRecord>();
+type TrainingExecutionPreflight = {
+  token: string;
+  workflowId: string;
+  captureId: string;
+  managedSessionId: string;
+  canonicalUrl: string;
+  fingerprintSha256: string;
+  plannedActions: ExistingPagePlannedAction[];
+  expiresAt: number;
+};
+const trainingExecutionPreflights = new Map<
+  string,
+  TrainingExecutionPreflight
+>();
+const TRAINING_EXECUTION_PREFLIGHT_TTL_MS = 5 * 60_000;
 
 function normalizeInstructionForIdentity(instruction: string) {
   return instruction.normalize("NFC").trim().replace(/\s+/g, " ");
@@ -652,6 +679,108 @@ async function lockManagedBrowserToApplication(session: ManagedBrowserSession) {
   return managedSessionStatus(session);
 }
 
+function assertSelectedCandidatesDeclaredUnique(workflow: SemanticWorkflow) {
+  for (const step of workflow.steps) {
+    if (!step.selectedLocator) {
+      throw new Error(`Step ${step.id} has no selected locator.`);
+    }
+    const selectedCandidate = step.candidates.find(
+      (candidate) => candidate.selector === step.selectedLocator?.primary,
+    );
+    if (selectedCandidate && !selectedCandidate.unique) {
+      throw new Error(`Step ${step.id} selected locator is not unique.`);
+    }
+  }
+}
+
+async function prepareLockedTrainingExecution(
+  workflowId: string,
+): Promise<{
+  record: LifecycleRecord;
+  capture: CaptureRecord;
+  session: ManagedBrowserSession;
+  canonicalUrl: string;
+  fingerprint: StructuralFingerprint;
+  compatibility: ReturnType<typeof compareStructuralFingerprints>;
+  plannedActions: ExistingPagePlannedAction[];
+}> {
+  const record = lifecycleRecords.get(workflowId);
+  if (!record) throw new Error("Workflow lifecycle record not found.");
+  if (
+    record.state !== "Draft" ||
+    record.studioProfileId !== "ncba-dpi-training"
+  ) {
+    throw new Error("A restored ncba-dpi-training Draft is required.");
+  }
+  const capture = record.captureId ? captures.get(record.captureId) : undefined;
+  if (
+    !capture ||
+    capture.studioProfileId !== "ncba-dpi-training" ||
+    !capture.managedSessionId
+  ) {
+    throw new Error("The Draft is not attached to a current Training capture.");
+  }
+  const session = managedSessions.get("ncba-dpi-training");
+  if (
+    !session ||
+    session.phase !== "application-locked" ||
+    session.id !== capture.managedSessionId
+  ) {
+    throw new Error(
+      "The locked managed session is not the session used for this capture.",
+    );
+  }
+  const configuredOrigin = new URL(managedTrainingOrigin).origin;
+  if (session.applicationOrigin !== configuredOrigin) {
+    throw new Error("The managed application origin is not the Training origin.");
+  }
+  const currentUrl = new URL(session.primaryPage.url());
+  if (currentUrl.origin !== configuredOrigin) {
+    throw new Error("The managed page is not on the exact Training origin.");
+  }
+  const canonicalUrl = canonicalizeTargetUrl(currentUrl.toString());
+  if (
+    canonicalUrl !== record.canonicalUrl ||
+    canonicalUrl !== canonicalizeTargetUrl(record.workflow.source.url)
+  ) {
+    throw new Error("The managed page pathname does not match the Draft.");
+  }
+  assertSelectedCandidatesDeclaredUnique(record.workflow);
+  const currentPageModel = await extractPageModel(session.primaryPage);
+  const currentFingerprint = createStructuralFingerprint(
+    redactCapturedPageModel(currentPageModel),
+  );
+  const compatibility = compareStructuralFingerprints(
+    record.structuralFingerprint,
+    currentFingerprint,
+  );
+  if (!compatibility.compatible) {
+    throw new Error("The locked Training page is structurally incompatible.");
+  }
+  const plannedActions = await inspectWorkflowOnExistingPage({
+    page: session.primaryPage,
+    workflow: record.workflow,
+    expectedOrigin: configuredOrigin,
+  });
+  if (
+    plannedActions.length !== record.workflow.steps.length ||
+    plannedActions.some(
+      (action) => !action.locator.unique || !action.preconditionsPassed,
+    )
+  ) {
+    throw new Error("Locator uniqueness or precondition validation failed.");
+  }
+  return {
+    record,
+    capture,
+    session,
+    canonicalUrl,
+    fingerprint: currentFingerprint,
+    compatibility,
+    plannedActions,
+  };
+}
+
 function workflowArtifactPath(workflowId: string) {
   if (!/^[a-z0-9][a-z0-9.-]{0,119}$/.test(workflowId)) {
     throw new Error("Invalid workflow artifact id.");
@@ -838,6 +967,16 @@ async function findIdempotentDraft(input: {
     for (const entry of entries) {
       try {
         const artifact = await readWorkflowArtifact(entry.id);
+        let candidateLifecycle = lifecycleRecords.get(entry.id);
+        if (!candidateLifecycle && existsSync(lifecyclePath(entry.id))) {
+          candidateLifecycle = await loadPersistedLifecycle(entry.id);
+        }
+        if (
+          candidateLifecycle &&
+          candidateLifecycle.studioProfileId !== input.studioProfileId
+        ) {
+          continue;
+        }
         if (
           artifactInstruction(artifact.workflow) ===
             normalizeInstructionForIdentity(input.instruction) &&
@@ -1040,6 +1179,28 @@ function studioHtml() {
           <button type="button" class="secondary" id="restoreDraft" disabled>Restore compatible Draft</button>
         </div>
       </section>
+      <section class="mode-panel hidden" id="trainingExecutionPanel" aria-label="Locked Training execution">
+        <div class="mode-title">LOCKED TRAINING TEST</div>
+        <strong class="warn">Training synthetic data only</strong>
+        <p class="hint">This test uses the already open, authenticated and application-locked Playwright page. It never opens another browser and never calls OpenAI.</p>
+        <div class="lifecycle-track" aria-label="Training workflow lifecycle">
+          <span data-training-lifecycle-state="Draft">Draft</span>
+          <span data-training-lifecycle-state="Validated">Validated</span>
+          <span data-training-lifecycle-state="Approved">Approved</span>
+          <span data-training-lifecycle-state="Promoted">Promoted</span>
+          <span data-training-lifecycle-state="Revoked">Revoked</span>
+        </div>
+        <button type="button" class="secondary" id="trainingExecutionPreflight" disabled>Prepare Training test preflight</button>
+        <strong>Planned actions and selected locators</strong>
+        <pre id="trainingPlannedActions">Preflight required.</pre>
+        <strong>Training preflight result</strong>
+        <pre id="trainingExecutionPreflightResult">Preflight required.</pre>
+        <label><input type="checkbox" id="trainingExecutionConfirmation" disabled> I confirm execution on the currently displayed synthetic Training record.</label>
+        <button type="button" class="primary" id="runLockedTraining" disabled>Test run on locked Training page</button>
+        <strong>Redacted Training telemetry</strong>
+        <pre id="trainingExecutionTelemetry">Runtime LLM calls: 0
+OpenAI requests: 0</pre>
+      </section>
       <section class="mode-panel" id="fixtureLifecyclePanel" aria-label="Fixture workflow lifecycle">
         <div class="mode-title">FIXTURE WORKFLOW JOURNEY</div>
         <div class="lifecycle-track" aria-label="Workflow lifecycle">
@@ -1120,7 +1281,8 @@ OpenAI requests: 0</pre>
       targetValid: false,
       authenticationPhase: "idle",
       canLockAuthentication: false,
-      compileInFlight: false
+      compileInFlight: false,
+      trainingExecutionPreflight: null
     };
     const output = document.getElementById("output");
     const workflowSelect = document.getElementById("workflow");
@@ -1132,6 +1294,7 @@ OpenAI requests: 0</pre>
     const indicatorVerified = document.getElementById("indicatorVerified");
     const compilerPayloadConfirmation = document.getElementById("compilerPayloadConfirmation");
     const restoreArtifactConfirmation = document.getElementById("restoreArtifactConfirmation");
+    const trainingExecutionConfirmation = document.getElementById("trainingExecutionConfirmation");
     const compileStages = ${JSON.stringify(compileProgressStages)};
     const controls = Array.from(document.querySelectorAll("button, select, input, textarea"));
     let targetValidationTimer;
@@ -1201,6 +1364,20 @@ OpenAI requests: 0</pre>
         state.profile.mode !== "clinical" ||
         state.lifecycle?.state !== "Promoted" ||
         !state.preflight?.allowed;
+      document.getElementById("trainingExecutionPreflight").disabled =
+        state.profile.id !== "ncba-dpi-training" ||
+        state.authenticationPhase !== "application-locked" ||
+        lifecycleState !== "Draft" ||
+        !state.capture ||
+        !state.workflow;
+      trainingExecutionConfirmation.disabled =
+        !state.trainingExecutionPreflight;
+      document.getElementById("runLockedTraining").disabled =
+        state.profile.id !== "ncba-dpi-training" ||
+        state.authenticationPhase !== "application-locked" ||
+        lifecycleState !== "Draft" ||
+        !state.trainingExecutionPreflight ||
+        !trainingExecutionConfirmation.checked;
     };
     const setBusy = busy => {
       controls.forEach(control => { control.disabled = busy; });
@@ -1223,6 +1400,13 @@ OpenAI requests: 0</pre>
     };
     const resetCapture = () => {
       state.capture = null;
+      state.trainingExecutionPreflight = null;
+      trainingExecutionConfirmation.checked = false;
+      trainingExecutionConfirmation.disabled = true;
+      document.getElementById("trainingPlannedActions").textContent = "Preflight required.";
+      document.getElementById("trainingExecutionPreflightResult").textContent = "Preflight required.";
+      document.getElementById("trainingExecutionTelemetry").textContent =
+        "Runtime LLM calls: 0\\nOpenAI requests: 0";
       compilerPayloadConfirmation.checked = false;
       compilerPayloadConfirmation.disabled = true;
       restoreArtifactConfirmation.checked = false;
@@ -1320,6 +1504,11 @@ OpenAI requests: 0</pre>
         node.classList.toggle("active", node.dataset.lifecycleState === current);
         node.classList.toggle("complete", currentIndex >= 0 && index < currentIndex);
       });
+      document.querySelectorAll("[data-training-lifecycle-state]").forEach(node => {
+        const index = lifecycleOrder.indexOf(node.dataset.trainingLifecycleState);
+        node.classList.toggle("active", node.dataset.trainingLifecycleState === current);
+        node.classList.toggle("complete", currentIndex >= 0 && index < currentIndex);
+      });
       const promotedSelect = document.getElementById("promotedWorkflow");
       if (state.lifecycle?.promotion && state.workflow) {
         const option = document.createElement("option");
@@ -1346,6 +1535,10 @@ OpenAI requests: 0</pre>
       renderAuthenticationState({ phase: "idle", canLock: false });
       document.getElementById("syntheticAttestation").classList.toggle("hidden", !profile.syntheticAttestationRequired);
       document.getElementById("trainingControls").classList.toggle("hidden", profile.mode === "clinical");
+      document.getElementById("trainingExecutionPanel").classList.toggle(
+        "hidden",
+        profile.id !== "ncba-dpi-training"
+      );
       document.getElementById("fixtureLifecyclePanel").classList.toggle("hidden", profile.id !== "ncba-dpi-fixture");
       document.getElementById("clinicalPanel").classList.toggle("hidden", profile.mode !== "clinical");
       document.getElementById("activeProfilePanel").classList.toggle("clinical", profile.mode === "clinical");
@@ -1444,6 +1637,11 @@ OpenAI requests: 0</pre>
     };
     const loadWorkflow = async workflowId => {
       if (!workflowId) return;
+      state.trainingExecutionPreflight = null;
+      trainingExecutionConfirmation.checked = false;
+      trainingExecutionConfirmation.disabled = true;
+      document.getElementById("trainingPlannedActions").textContent = "Preflight required.";
+      document.getElementById("trainingExecutionPreflightResult").textContent = "Preflight required.";
       const workflow = await fetchJsonWithTimeout(
         "/api/workflow?id=" + encodeURIComponent(workflowId)
       );
@@ -1644,6 +1842,86 @@ OpenAI requests: 0</pre>
     }
     document.getElementById("runA").addEventListener("click", () => run("A"));
     document.getElementById("runB").addEventListener("click", () => run("B"));
+    document.getElementById("trainingExecutionPreflight").addEventListener("click", async () => {
+      setBusy(true);
+      setStatus("Checking locked Training page");
+      state.trainingExecutionPreflight = null;
+      trainingExecutionConfirmation.checked = false;
+      try {
+        const json = await requestJson("/api/training/preflight", {
+          studioProfileId: state.profile.id,
+          workflowId: state.workflow?.id
+        });
+        state.trainingExecutionPreflight = json;
+        document.getElementById("trainingPlannedActions").textContent =
+          JSON.stringify(
+            json.plannedActions.map((step, index) => ({
+              actionNumber: index + 1,
+              stepId: step.stepId,
+              action: step.action,
+              target: step.target,
+              selectedLocator: step.selectedLocator,
+              value: step.value,
+              locatorStrategy: step.locator.strategy,
+              locatorMatchCount: step.locator.matchCount,
+              selectedLocatorUnique: step.locator.unique
+            })),
+            null,
+            2
+          );
+        document.getElementById("trainingExecutionPreflightResult").textContent =
+          JSON.stringify({
+            warning: json.warning,
+            ...json.result,
+            llmCalls: json.llmCalls,
+            openAIRequests: json.openAIRequests
+          }, null, 2);
+        trainingExecutionConfirmation.disabled = false;
+        setStatus("Locked Training preflight passed", "ok");
+      } catch (error) {
+        document.getElementById("trainingExecutionPreflightResult").textContent =
+          JSON.stringify(error.response ?? { error: error.message }, null, 2);
+        setStatus("Locked Training preflight rejected", "error");
+      } finally {
+        setBusy(false);
+      }
+    });
+    document.getElementById("runLockedTraining").addEventListener("click", async () => {
+      if (!state.trainingExecutionPreflight || !trainingExecutionConfirmation.checked) return;
+      setBusy(true);
+      setStatus("Running on locked synthetic Training page");
+      try {
+        const json = await requestJson("/api/training/run-locked", {
+          studioProfileId: state.profile.id,
+          workflowId: state.workflow?.id,
+          preflightToken: state.trainingExecutionPreflight.token,
+          confirmed: trainingExecutionConfirmation.checked
+        });
+        state.trainingExecutionPreflight = null;
+        trainingExecutionConfirmation.checked = false;
+        state.telemetry = json.telemetry;
+        state.lifecycle = json.lifecycle;
+        document.getElementById("runtimeCalls").textContent = "0";
+        document.getElementById("trainingExecutionTelemetry").textContent =
+          JSON.stringify({
+            stepResults: json.telemetry.steps,
+            durationMs: json.telemetry.durationMs,
+            runtimeLlmCalls: json.telemetry.llmCalls,
+            openAIRequests: json.telemetry.openAIRequests
+          }, null, 2);
+        renderLifecycle();
+        setStatus(json.status, "ok");
+      } catch (error) {
+        state.trainingExecutionPreflight = null;
+        trainingExecutionConfirmation.checked = false;
+        const result = error.response ?? { error: error.message };
+        document.getElementById("trainingExecutionTelemetry").textContent =
+          JSON.stringify(result, null, 2);
+        setStatus("Locked Training test stopped", "error");
+      } finally {
+        setBusy(false);
+      }
+    });
     const lifecycleRequest = async (action, body = {}) => {
       if (!state.workflow) throw new Error("Compile a fixture workflow first.");
       const json = await requestJson(
@@ -1826,7 +2104,7 @@ OpenAI requests: 0</pre>
         setBusy(false);
       }
     });
-    [...attestationInputs, indicatorVerified, compilerPayloadConfirmation, restoreArtifactConfirmation].forEach(input => {
+    [...attestationInputs, indicatorVerified, compilerPayloadConfirmation, restoreArtifactConfirmation, trainingExecutionConfirmation].forEach(input => {
       input.addEventListener("change", syncJourneyControls);
     });
     targetUrl.addEventListener("input", () => {
@@ -2130,6 +2408,46 @@ if (allowExplicitLocalSsoFixture) {
       }
     });
     res.json({ blocked, llmCalls: 0, openAIRequests: 0 });
+  });
+  app.post("/api/test-only/training/navigate", async (req, res) => {
+    const session = managedSessions.get("ncba-dpi-training");
+    if (!session || session.phase !== "application-locked") {
+      res.status(409).json({ error: "Application is not locked." });
+      return;
+    }
+    const pathname =
+      req.body.destination === "wrong-path"
+        ? "/ncba-fixture?mode=training&variant=A"
+        : "/cgi-professional";
+    try {
+      await session.primaryPage.goto(
+        `${session.applicationOrigin}${pathname}`,
+      );
+      res.json({
+        navigated: true,
+        canonicalUrl: canonicalizeTargetUrl(session.primaryPage.url()),
+        llmCalls: 0,
+        openAIRequests: 0,
+      });
+    } catch {
+      res.status(409).json({ error: "Synthetic navigation failed." });
+    }
+  });
+  app.get("/api/test-only/training/cgi-state", async (_req, res) => {
+    const session = managedSessions.get("ncba-dpi-training");
+    if (!session || session.phase !== "application-locked") {
+      res.status(409).json({ error: "Application is not locked." });
+      return;
+    }
+    const result = await session.primaryPage.evaluate(() => ({
+      expectedSyntheticValuePresent:
+        (document.querySelector("#observation") as HTMLTextAreaElement | null)
+          ?.value === "test du DR LEROY",
+      savePostconditionVisible:
+        document.querySelector("#observation-result")?.textContent ===
+        "Enregistrement synthétique effectué",
+    }));
+    res.json({ ...result, llmCalls: 0, openAIRequests: 0 });
   });
 }
 app.delete("/api/browser-profiles/:profileId", async (req, res) => {
@@ -2527,7 +2845,22 @@ app.post("/api/workflows/restore-draft", async (req, res) => {
     const workflowId =
       typeof req.body.workflowId === "string" ? req.body.workflowId : "";
     const artifact = await readWorkflowArtifact(workflowId);
-    const canonicalUrl = canonicalizeTargetUrl(resolved.url);
+    const managedSession = studioProfile.managedBrowserOnly
+      ? managedSessions.get(studioProfile.id)
+      : undefined;
+    if (
+      studioProfile.managedBrowserOnly &&
+      (!managedSession ||
+        managedSession.phase !== "application-locked" ||
+        managedSession.id !== capture.managedSessionId)
+    ) {
+      throw new Error(
+        "Draft restoration requires the same locked managed session as the capture.",
+      );
+    }
+    const canonicalUrl = canonicalizeTargetUrl(
+      managedSession?.primaryPage.url() ?? resolved.url.toString(),
+    );
     let persisted = lifecycleRecords.get(workflowId);
     if (!persisted && existsSync(lifecyclePath(workflowId))) {
       persisted = await loadPersistedLifecycle(workflowId);
@@ -2584,6 +2917,143 @@ app.get("/api/workflow-lifecycle", async (req, res) => {
     return;
   }
   res.json({ lifecycle: lifecycleSummary(record) });
+});
+app.post("/api/training/preflight", async (req, res) => {
+  if (req.body.studioProfileId !== "ncba-dpi-training") {
+    res.status(403).json({
+      error: "Locked Training execution requires ncba-dpi-training.",
+    });
+    return;
+  }
+  const workflowId =
+    typeof req.body.workflowId === "string" ? req.body.workflowId : "";
+  try {
+    const prepared = await prepareLockedTrainingExecution(workflowId);
+    const token = randomUUID();
+    const expiresAt = Date.now() + TRAINING_EXECUTION_PREFLIGHT_TTL_MS;
+    trainingExecutionPreflights.set(token, {
+      token,
+      workflowId,
+      captureId: prepared.capture.id,
+      managedSessionId: prepared.session.id,
+      canonicalUrl: prepared.canonicalUrl,
+      fingerprintSha256: prepared.fingerprint.sha256,
+      plannedActions: prepared.plannedActions,
+      expiresAt,
+    });
+    res.json({
+      token,
+      warning: "Training synthetic data only",
+      result: {
+        passed: true,
+        profileId: "ncba-dpi-training",
+        phase: "APPLICATION LOCKED",
+        lifecycleState: prepared.record.state,
+        sameManagedSession: true,
+        originMatch: true,
+        pathnameMatch: true,
+        structuralCompatibility: prepared.compatibility.score,
+        missingRequired: prepared.compatibility.missingRequired,
+        locatorsUnique: true,
+        preconditionsPassed: true,
+      },
+      plannedActions: prepared.plannedActions,
+      expiresAt: new Date(expiresAt).toISOString(),
+      llmCalls: 0,
+      openAIRequests: 0,
+    });
+  } catch (error) {
+    res.status(409).json({
+      error: error instanceof Error ? error.message : String(error),
+      passed: false,
+      llmCalls: 0,
+      openAIRequests: 0,
+    });
+  }
+});
+app.post("/api/training/run-locked", async (req, res) => {
+  if (
+    req.body.studioProfileId !== "ncba-dpi-training" ||
+    req.body.confirmed !== true
+  ) {
+    res.status(403).json({
+      error:
+        "Locked Training execution requires the Training profile and explicit human confirmation.",
+    });
+    return;
+  }
+  const token =
+    typeof req.body.preflightToken === "string"
+      ? req.body.preflightToken
+      : "";
+  const preflight = trainingExecutionPreflights.get(token);
+  trainingExecutionPreflights.delete(token);
+  if (!preflight || preflight.expiresAt < Date.now()) {
+    res.status(409).json({ error: "Training preflight is missing or expired." });
+    return;
+  }
+  try {
+    const prepared = await prepareLockedTrainingExecution(
+      String(req.body.workflowId ?? ""),
+    );
+    if (
+      prepared.record.workflow.id !== preflight.workflowId ||
+      prepared.capture.id !== preflight.captureId ||
+      prepared.session.id !== preflight.managedSessionId ||
+      prepared.canonicalUrl !== preflight.canonicalUrl ||
+      prepared.fingerprint.sha256 !== preflight.fingerprintSha256
+    ) {
+      throw new Error(
+        "The page, capture, workflow, or managed session changed after preflight.",
+      );
+    }
+    const telemetry = await runWorkflowOnExistingPage({
+      page: prepared.session.primaryPage,
+      workflow: prepared.record.workflow,
+      expectedOrigin: prepared.session.applicationOrigin,
+    });
+    const passed =
+      telemetry.steps.length === prepared.record.workflow.steps.length &&
+      telemetry.steps.every((step) => step.status === "passed");
+    if (!passed) {
+      res.status(422).json({
+        error: "Training test stopped at the first failed step.",
+        telemetry,
+        lifecycle: lifecycleSummary(prepared.record),
+      });
+      return;
+    }
+    prepared.record.validation = {
+      passed: true,
+      variants: [],
+      trainingTest: {
+        passed: true,
+        validatedAt: telemetry.finishedAt,
+        stepIds: telemetry.steps.map((step) => step.stepId),
+        llmCalls: 0,
+        openAIRequests: 0,
+      },
+    };
+    prepared.record.state = transitionWorkflow(
+      prepared.record.state,
+      "Validated",
+      true,
+    );
+    await persistLifecycle(prepared.record);
+    res.json({
+      status: "Training test passed — Draft marked Validated",
+      telemetry,
+      lifecycle: lifecycleSummary(prepared.record),
+      llmCalls: 0,
+      openAIRequests: 0,
+    });
+  } catch (error) {
+    res.status(409).json({
+      error: error instanceof Error ? error.message : String(error),
+      llmCalls: 0,
+      openAIRequests: 0,
+    });
+  }
 });
 app.post("/api/workflows/:workflowId/validate", async (req, res) => {
   const record = lifecycleRecords.get(req.params.workflowId);
