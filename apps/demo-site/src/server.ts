@@ -28,8 +28,10 @@ export function createDemoServer(
     const variant = req.query.variant === "B" ? "B" : "A";
     res.type("html").send(renderNcbaFixture(mode, variant));
   });
-  app.get("/cgi-professional", (_req, res) => {
-    res.type("html").send(renderCgiFixture());
+  app.get("/cgi-professional", (req, res) => {
+    res
+      .type("html")
+      .send(renderCgiFixture({ largeCandidateSet: req.query.large === "1" }));
   });
   app.get("/sso-app/start", (_req, res) => {
     const returnTo = `http://127.0.0.1:${port}/sso-app/callback?session_token=SYNTHETIC-RETURN-TOKEN`;

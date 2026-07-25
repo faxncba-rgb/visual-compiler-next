@@ -128,7 +128,7 @@ test("Studio visibly demonstrates capture through promoted A/B execution", async
   await expect(compile).toBeEnabled();
 
   await compile.click();
-  await expect(page.locator("#status")).toHaveText("Compiled — Draft");
+  await expect(page.locator("#status")).toContainText("Draft");
   await expect(page.locator('[data-lifecycle-state="Draft"]')).toHaveClass(
     /active/,
   );
@@ -229,8 +229,7 @@ test("profile selection performs no navigation and compilation is attestation-ga
   await expect(page.getByRole("button", { name: "Compile" })).toBeDisabled();
   expect(ncbaRequests).toEqual([]);
 
-  const dynamicTrainingUrl =
-    `${syntheticApplicationOrigin}/sso-app/start?patient_id=FAKE-E2E&mytime=123456`;
+  const dynamicTrainingUrl = `${syntheticApplicationOrigin}/sso-app/start?patient_id=FAKE-E2E&mytime=123456`;
   await page.getByLabel("Target Website URL").fill(dynamicTrainingUrl);
   await page.getByLabel("Target Website URL").press("Tab");
   await expect(page.locator("#targetValidation")).toContainText(
@@ -360,8 +359,7 @@ test("managed Training completes synthetic popup SSO before strict application l
     "SYNTHETIC-POPUP-TOKEN",
     "SYNTHETIC-FRAME-TOKEN",
   ];
-  const dynamicTarget =
-    `${syntheticApplicationOrigin}/sso-app/start?patient_id=FAKE-E2E-SSO&mytime=987654`;
+  const dynamicTarget = `${syntheticApplicationOrigin}/sso-app/start?patient_id=FAKE-E2E-SSO&mytime=987654`;
 
   await page.goto(studioOrigin);
   await page
@@ -381,10 +379,28 @@ test("managed Training completes synthetic popup SSO before strict application l
     .all()) {
     await checkbox.check();
   }
-  page.once("dialog", (dialog) => dialog.accept());
-  await page
-    .getByRole("button", { name: "Open in managed browser" })
-    .click();
+  await page.evaluate(() => {
+    window.confirm = () => true;
+  });
+  const managedOpenResponsePromise = page.waitForResponse(
+    (response) =>
+      response.url() === `${studioOrigin}/api/managed-browser/open` &&
+      response.request().method() === "POST",
+  );
+  const managedOpenButton = page.getByRole("button", {
+    name: "Open in managed browser",
+  });
+  await expect(managedOpenButton).toBeEnabled();
+  await managedOpenButton.evaluate((button: HTMLButtonElement) =>
+    button.click(),
+  );
+  const managedOpenResponse = await managedOpenResponsePromise;
+  expect(await managedOpenResponse.json()).toMatchObject({
+    phase: "authentication-bootstrap",
+    compilationAllowed: false,
+    llmCalls: 0,
+    openAIRequests: 0,
+  });
   await expect(page.locator("#authenticationState")).toContainText(
     "AUTHENTICATION IN PROGRESS",
     { timeout: 15_000 },
@@ -489,7 +505,7 @@ test("managed Training completes synthetic popup SSO before strict application l
   await expect(page.getByRole("button", { name: "Compile" })).toBeDisabled();
   await page.locator("#compilerPayloadConfirmation").check();
   await page.getByRole("button", { name: "Compile" }).click();
-  await expect(page.locator("#status")).toHaveText("Compiled — Draft", {
+  await expect(page.locator("#status")).toContainText("Draft", {
     timeout: 15_000,
   });
   const artifactText = await page.locator("#output").innerText();

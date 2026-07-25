@@ -17,3 +17,11 @@ Training navigation permits dynamic paths and query strings only when `new URL(t
 During `AUTHENTICATION BOOTSTRAP`, HTTPS redirects and popups may leave the application origin for manual SSO, but capture and compilation return a closed-state error. Unsafe schemes, unencrypted HTTP, and OpenAI domains remain blocked. Studio reports only origins. The explicit lock is accepted only when the primary page is back on the configured application origin. During `APPLICATION LOCKED`, strict origin enforcement resumes for primary-page navigation. HTTPS subresources and iframe navigation remain available for application compatibility, while cross-origin frames are counted and excluded from capture. Authentication origins and parameters are never persisted in artifacts.
 
 Run `npm run test:security` before every push. It detects probable secrets and forbidden session files, enforces the runtime import boundary, and exercises network safeguards. Do not attach credentials, sessions, screenshots, or patient information to a report.
+
+Compile responses and logs never contain complete artifacts. Idempotency and
+lifecycle sidecars contain only hashes, canonical origin/path, profile id,
+structural fingerprint, lifecycle state, validation metadata and timestamps.
+Artifact loading performs schema, URL, sensitive-key and token-pattern checks.
+Draft restoration additionally requires a fresh confirmed capture, compatible
+fingerprint and unique selected locators. The OpenAI client has a bounded
+timeout and zero automatic retries; runtime OpenAI blocking is unchanged.

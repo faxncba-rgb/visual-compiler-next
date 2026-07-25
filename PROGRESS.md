@@ -1,5 +1,17 @@
 # Progress
 
+## 2026-07-25 — Recoverable compact compilation
+
+- Diagnosed the post-write busy state: the immutable artifact was saved before the HTTP response, while Studio remained busy until a full workflow response was transferred, parsed, listed, applied, and rendered with no timeout or recovery record.
+- `POST /api/compile` now returns only `workflowId`, logical artifact path, lifecycle summary, summarized diagnostics, and reuse state. Studio then loads the immutable artifact through `GET /api/workflow` and renders a bounded summary rather than all candidates.
+- Added the six visible progress stages, a 120-second OpenAI timeout with zero retries, a 180-second frontend timeout, synchronous double-click gating, and server-side identical-job exclusion.
+- Added SHA-256 idempotency over normalized instruction, Training profile, canonical origin/path, and reviewed compiler payload hash. Compatible existing artifacts are reused without GPT.
+- Draft lifecycle and idempotency manifests are persisted in restricted local sidecars and hash-validated after restart. A fresh confirmed capture can restore a compatible selected artifact after fingerprint and unique-locator checks.
+- Verified the local GPT-5.6 artifact `dans-la-zone-de-texte-ecris-test-du-dr-leroy-puis-cl-55b4374b` without displaying its contents: 128,112 bytes, valid schema, canonical URL, 10/412 locator candidates, SHA-256 `ec72a93591ae8e4a2403661818c7b65ffc59dbdd2f21c56f9bd1e23f09691474`, and no `patient_id`, `mytime`, captured fixture value, cookie/storage field, secret token, or URL query.
+- The real artifact remains unchanged, ignored locally, and untracked. No DPI navigation, capture, compilation, or OpenAI request occurred.
+- Final validation: build passed; 46/46 unit and integration tests passed; 9/9 focused security tests plus a 79-file scan passed; and 13/13 Playwright E2E tests passed.
+- The restart E2E simulates an artifact above 100 KB, proves a sub-10 KB compile response, separate GET loading, one request after a double click, concurrent-call rejection, idempotent reuse, persistent Draft recovery after a real Studio process restart, human-confirmed compatible restoration, bounded display, and `modelCalls: 0`.
+
 ## 2026-07-25 — Privacy-preserving semantic locator recovery
 
 - Confirmed that the previous compiler payload removed the accessible names and labels required by the locator engine, leaving external controls without candidates when no fixture-only stable label existed.

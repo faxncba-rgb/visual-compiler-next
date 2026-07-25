@@ -40,3 +40,11 @@ Open in managed browser
 The managed browser context is ephemeral and memory-only. Route policy distinguishes primary-page navigation from iframe navigation, popup navigation, and subresources. OpenAI HTTP/WebSocket traffic is blocked in both states. Cross-origin frames may render after lock but never enter the page model.
 
 Artifacts remain exclusive and versioned. Existing files cannot be silently overwritten. SHA-256 is verified before a promoted workflow may run. Ed25519 with a private key outside the repository is the next integrity milestone.
+
+Compilation is coordinated as a recoverable local job. The POST response is a
+bounded acknowledgement; immutable workflow bytes are retrieved separately.
+Progress is exposed by request id, OpenAI and frontend waits are bounded,
+identical in-flight jobs are rejected, and completed jobs are indexed by a
+SHA-256 key over instruction, profile, canonical URL and reviewed payload hash.
+Lifecycle and idempotency sidecars live in a restrictive `.state` directory
+under workflow storage and are revalidated against the artifact hash at startup.

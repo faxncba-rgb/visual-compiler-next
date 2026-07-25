@@ -1,4 +1,16 @@
-export function renderCgiFixture() {
+export function renderCgiFixture(
+  options: { largeCandidateSet?: boolean } = {},
+) {
+  const largeCandidateSet = options.largeCandidateSet
+    ? `<section aria-labelledby="bulk-heading">
+      <h2 id="bulk-heading">Commandes administratives secondaires</h2>
+      ${Array.from(
+        { length: 220 },
+        (_, index) =>
+          `<button type="button" aria-label="Enregistrer secondaire ${index + 1}">Enregistrer</button>`,
+      ).join("\n")}
+    </section>`
+    : "";
   return `<!doctype html>
 <html lang="fr">
 <head>
@@ -37,6 +49,7 @@ export function renderCgiFixture() {
       <button type="button" class="save">Enregistrer</button>
       <p id="internal-result" role="status">Aucune note enregistrée.</p>
     </section>
+    ${largeCandidateSet}
 
     <input type="hidden" name="session_token" value="TOKEN-SYNTHETIQUE-EXCLU">
   </main>

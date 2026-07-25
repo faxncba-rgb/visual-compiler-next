@@ -129,16 +129,12 @@ export function createRedactedCompilerPageModel(model: PageModel) {
     const accessibleName = normalizedInterfaceText(node.accessibleName);
     const labelText = normalizedInterfaceText(node.labelText);
     const ariaLabel = normalizedInterfaceText(node.ariaLabel);
-    const ariaLabelledByText = normalizedInterfaceText(
-      node.ariaLabelledByText,
-    );
+    const ariaLabelledByText = normalizedInterfaceText(node.ariaLabelledByText);
     const placeholder = normalizedInterfaceText(node.placeholder);
     const controlText = normalizedInterfaceText(node.controlText);
     const structuralHeading = normalizedInterfaceText(node.structuralHeading);
     accessibleNamesKept += Number(Boolean(accessibleName));
-    labelsKept += Number(
-      Boolean(labelText || ariaLabel || ariaLabelledByText),
-    );
+    labelsKept += Number(Boolean(labelText || ariaLabel || ariaLabelledByText));
     const rawSemanticTexts = [
       ["control-name", "accessible-name", node.accessibleName],
       ["interface-label", "associated-label", node.labelText],
@@ -377,8 +373,7 @@ export function mockInterpretInstruction(
         {
           id: "fill-administrative-observation",
           action: "fill",
-          intent:
-            "Fill the multiline field labelled Observation du praticien.",
+          intent: "Fill the multiline field labelled Observation du praticien.",
           target: {
             role: "textbox",
             accessibleName: "Observation du praticien",
@@ -552,7 +547,17 @@ export async function interpretInstructionWithOpenAI(
   if (!process.env.OPENAI_API_KEY) {
     throw new Error("OPENAI_API_KEY is required for live GPT-5.6 compilation.");
   }
-  const client = new OpenAI();
+  const configuredTimeout = Number.parseInt(
+    process.env.OPENAI_COMPILE_TIMEOUT_MS ?? "120000",
+    10,
+  );
+  const timeout =
+    Number.isFinite(configuredTimeout) &&
+    configuredTimeout >= 1_000 &&
+    configuredTimeout <= 600_000
+      ? configuredTimeout
+      : 120_000;
+  const client = new OpenAI({ timeout, maxRetries: 0 });
   const redactedPageModel = createRedactedCompilerPageModel(model);
   const response = await client.responses.parse({
     model: process.env.OPENAI_COMPILE_MODEL ?? "gpt-5.6",

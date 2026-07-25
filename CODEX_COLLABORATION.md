@@ -14,6 +14,11 @@ For the 2026-07-25 SSO milestone, automated and visual validation uses only a lo
 
 For the semantic-locator recovery milestone, Codex must use only the local CGI fixture and the explicit offline mock instruction. No real captured payload may enter tests, logs, screenshots, documentation, or commits. Live OpenAI compilation remains disabled. A real Training retry requires a later explicit authorization after the local fixture validation is complete.
 
+For compile recovery work, the existing 128 KB GPT artifact is immutable and
+must remain local and untracked. Codex may inspect only bounded metadata and
+privacy-scan results, must not print the complete artifact, and must exercise
+recovery exclusively with the local large CGI fixture and `USE_LIVE_OPENAI=false`.
+
 ## Components Codex Designed
 
 - Monorepo structure separating compile-time and runtime packages.

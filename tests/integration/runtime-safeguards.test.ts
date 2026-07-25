@@ -36,6 +36,24 @@ describe("runtime safeguards", () => {
     expect(existsSync("packages/runtime/src/index.ts")).toBe(true);
   });
 
+  it("bounds compilation and returns artifacts through a separate read path", async () => {
+    const studio = await readFile("apps/studio/backend/src/server.ts", "utf8");
+    const interpreter = await readFile(
+      "packages/compiler/src/interpreter.ts",
+      "utf8",
+    );
+    expect(interpreter).toContain("OPENAI_COMPILE_TIMEOUT_MS");
+    expect(interpreter).toContain("new OpenAI({ timeout, maxRetries: 0 })");
+    expect(studio).toContain("COMPILE_RESPONSE_TIMEOUT_MS");
+    expect(studio).toContain("activeCompilationKeys");
+    expect(studio).toContain('app.get("/api/compile-status"');
+    expect(studio).toContain('app.get("/api/workflow"');
+    expect(studio).toContain("compactCompileResponse");
+    expect(studio).not.toContain(
+      "res.json({ workflow, lifecycle: lifecycleSummary(lifecycle) })",
+    );
+  });
+
   it("ships the validated GPT-5.6 runtime artifact without credentials", async () => {
     const raw = await readFile(
       "compiled-workflows/pending-review.workflow.json",

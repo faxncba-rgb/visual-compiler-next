@@ -63,3 +63,18 @@ instruction-derived slug and a short random suffix. Final publication uses an
 exclusive filesystem operation, so an existing artifact cannot be replaced even
 if an id collision occurs. Studio lists and executes the explicitly selected
 artifact. The validated GPT-5.6 reference artifact remains immutable.
+
+## ADR-006: Compact Compile Acknowledgements and Persistent Idempotency
+
+Date: 2026-07-25
+
+Status: Accepted
+
+`POST /api/compile` never returns the complete workflow. It returns a bounded
+acknowledgement and Studio retrieves the immutable artifact through
+`GET /api/workflow`. A SHA-256 idempotency key covers the normalized
+instruction, Training profile, canonical origin/path, and reviewed compiler
+payload hash. Restricted local sidecars persist lifecycle state, artifact hash,
+fingerprint and idempotency mapping without session or medical data. A
+compatible existing artifact is restored as Draft only after a fresh capture,
+unique-locator verification, and explicit human confirmation.

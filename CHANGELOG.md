@@ -16,6 +16,10 @@
 - Added exact payload preview and SHA-bound human confirmation before Training compilation.
 - Added ranked locator fallbacks that work without test attributes, per-step candidate diagnostics, and count-only zero-candidate explanations.
 - Added a professional CGI-style local fixture with duplicate textareas/buttons and an offline fill-then-save E2E replay.
+- Replaced the large `/api/compile` response with a compact acknowledgement and separate `GET /api/workflow` load.
+- Added visible compile stages, OpenAI/frontend timeouts, double-click and concurrent-call refusal, and SHA-256 idempotency reuse.
+- Persisted lifecycle Draft state and idempotency manifests in restricted local sidecars, including compatible human-confirmed restoration after Studio restart.
+- Added a restart E2E proving that a simulated artifact larger than 100 KB is saved, compactly acknowledged, reloaded, restored, and displayed without an infinite busy state.
 
 ## 0.2.0 — 2026-07-22
 

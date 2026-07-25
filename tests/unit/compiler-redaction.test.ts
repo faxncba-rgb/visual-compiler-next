@@ -244,6 +244,7 @@ describe("compiler privacy boundary", () => {
     };
     const directory = await mkdtemp(path.join(tmpdir(), "vc-cgi-"));
     try {
+      const progress: string[] = [];
       const workflow = await compileWorkflow({
         instruction: CGI_FIXTURE_INSTRUCTION,
         url: model.url,
@@ -256,14 +257,25 @@ describe("compiler privacy boundary", () => {
           source: "mock" as const,
           modelCalls: 0,
         }),
+        onProgress: (stage) => {
+          progress.push(stage);
+        },
       });
+      expect(progress).toEqual([
+        "Preparing redacted payload",
+        "Calling GPT-5.6",
+        "Validating Semantic IR",
+        "Generating locators",
+        "Saving artifact",
+        "Compilation complete",
+      ]);
       expect(workflow.steps.map((step) => step.action)).toEqual([
         "fill",
         "click",
       ]);
-      expect(
-        workflow.steps.every((step) => step.candidates.length > 0),
-      ).toBe(true);
+      expect(workflow.steps.every((step) => step.candidates.length > 0)).toBe(
+        true,
+      );
       expect(workflow.steps[0].selectedLocator?.rule?.candidateText).toBe(
         "Observation du praticien",
       );

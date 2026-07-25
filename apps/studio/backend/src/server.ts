@@ -7,7 +7,9 @@ import {
   mkdir,
   readdir,
   readFile,
+  rename,
   rm,
+  writeFile,
 } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
@@ -22,10 +24,12 @@ import {
   createRedactedCompilerPageModel,
 } from "@visual-compiler/compiler";
 import { extractPageModel, type PageModel } from "@visual-compiler/page-model";
+import { generateCandidates } from "@visual-compiler/locator-engine";
 import { runCompiledWorkflow } from "@visual-compiler/runtime";
 import {
   createStudioApplicationProfiles,
   clinicalPreflight,
+  compareStructuralFingerprints,
   computeWorkflowHash,
   createRedactedAudit,
   createStructuralFingerprint,
@@ -35,6 +39,7 @@ import {
   requireValidAttestation,
   StudioProfileIdSchema,
   transitionWorkflow,
+  WorkflowStateSchema,
   type PromotedWorkflow,
   type RedactedPageModel,
   type StructuralFingerprint,
@@ -57,6 +62,34 @@ import {
 const port = Number(process.env.STUDIO_PORT ?? 3000);
 const host = process.env.STUDIO_HOST ?? "0.0.0.0";
 const defaultWorkflowId = path.basename(WORKFLOW_PATH, ".json");
+const lifecycleStorageDirectory = path.join(WORKFLOW_STORAGE_DIR, ".state");
+const compilationRequests = new Map<
+  string,
+  {
+    stage: CompileProgressStage;
+    complete: boolean;
+    error?: string;
+    updatedAt: string;
+  }
+>();
+const activeCompilationKeys = new Set<string>();
+const COMPILE_RESPONSE_TIMEOUT_MS = 180_000;
+const compileProgressDelayMs = Math.max(
+  0,
+  Math.min(
+    1_000,
+    Number.parseInt(process.env.COMPILER_PROGRESS_DELAY_MS ?? "0", 10) || 0,
+  ),
+);
+const compileProgressStages = [
+  "Preparing redacted payload",
+  "Calling GPT-5.6",
+  "Validating Semantic IR",
+  "Generating locators",
+  "Saving artifact",
+  "Compilation complete",
+] as const;
+type CompileProgressStage = (typeof compileProgressStages)[number];
 const browserProfileRoot = path.resolve(
   process.env.VISUAL_COMPILER_BROWSER_PROFILE_ROOT ??
     path.join(
@@ -98,15 +131,12 @@ const publicDemoUrl = normalizedBaseUrl(
   "DEMO_SITE_PUBLIC_URL",
 );
 const managedTrainingOrigin = normalizedBaseUrl(
-  process.env.NCBA_TRAINING_ORIGIN ??
-    "https://dpi-ncba.gbna-sante.fr",
+  process.env.NCBA_TRAINING_ORIGIN ?? "https://dpi-ncba.gbna-sante.fr",
   "NCBA_TRAINING_ORIGIN",
 );
 const allowExplicitLocalSsoFixture =
   process.env.ALLOW_EXPLICIT_LOCAL_SSO_FIXTURE === "true" &&
-  ["127.0.0.1", "localhost"].includes(
-    new URL(managedTrainingOrigin).hostname,
-  );
+  ["127.0.0.1", "localhost"].includes(new URL(managedTrainingOrigin).hostname);
 const syntheticSsoAuthOrigin = allowExplicitLocalSsoFixture
   ? normalizedBaseUrl(
       process.env.SSO_FIXTURE_AUTH_ORIGIN ?? "http://127.0.0.1:4275",
@@ -130,9 +160,7 @@ function resolveStudioTarget(
     allowExplicitLocalFixture: allowExplicitLocalSsoFixture,
   });
 }
-type ManagedBrowserPhase =
-  | "authentication-bootstrap"
-  | "application-locked";
+type ManagedBrowserPhase = "authentication-bootstrap" | "application-locked";
 type ManagedBrowserSession = {
   id: string;
   browser: Browser;
@@ -142,24 +170,30 @@ type ManagedBrowserSession = {
   applicationOrigin: string;
 };
 const managedSessions = new Map<StudioProfileId, ManagedBrowserSession>();
-const captures = new Map<
-  string,
-  {
-    id: string;
-    studioProfileId: StudioProfileId;
-    pageModel: PageModel;
-    redactedModel: RedactedPageModel;
-    fingerprint: StructuralFingerprint;
-    attestedAt: string;
-    managedSessionId?: string;
-    compilerPayload: ReturnType<typeof createRedactedCompilerPageModel>;
-    compilerPayloadSha256: string;
-  }
->();
+type CaptureRecord = {
+  id: string;
+  studioProfileId: StudioProfileId;
+  pageModel: PageModel;
+  redactedModel: RedactedPageModel;
+  fingerprint: StructuralFingerprint;
+  attestedAt: string;
+  managedSessionId?: string;
+  compilerPayload: ReturnType<typeof createRedactedCompilerPageModel>;
+  compilerPayloadSha256: string;
+};
+const captures = new Map<string, CaptureRecord>();
 type LifecycleRecord = {
   workflow: SemanticWorkflow;
   state: WorkflowState;
-  captureId: string;
+  captureId?: string;
+  studioProfileId: StudioProfileId;
+  canonicalUrl: string;
+  compilerPayloadSha256: string;
+  structuralFingerprint: StructuralFingerprint;
+  idempotencyKey: string;
+  artifactSha256: string;
+  createdAt: string;
+  updatedAt: string;
   validation?: {
     passed: boolean;
     variants: Array<{ variant: "A" | "B"; passed: boolean }>;
@@ -169,6 +203,115 @@ type LifecycleRecord = {
   lastPreflight?: ReturnType<typeof clinicalPreflight>;
 };
 const lifecycleRecords = new Map<string, LifecycleRecord>();
+
+function normalizeInstructionForIdentity(instruction: string) {
+  return instruction.normalize("NFC").trim().replace(/\s+/g, " ");
+}
+
+function compileIdempotencyKey(input: {
+  instruction: string;
+  studioProfileId: StudioProfileId;
+  canonicalUrl: string;
+  compilerPayloadSha256: string;
+}) {
+  const canonical = new URL(canonicalizeTargetUrl(input.canonicalUrl));
+  return createHash("sha256")
+    .update(
+      JSON.stringify({
+        instruction: normalizeInstructionForIdentity(input.instruction),
+        profileId: input.studioProfileId,
+        origin: canonical.origin,
+        pathname: canonical.pathname,
+        compilerPayloadSha256: input.compilerPayloadSha256,
+      }),
+    )
+    .digest("hex");
+}
+
+function artifactLogicalPath(workflowId: string) {
+  return `compiled-workflows/${workflowId}.json`;
+}
+
+function lifecyclePath(workflowId: string) {
+  return path.join(lifecycleStorageDirectory, `${workflowId}.lifecycle.json`);
+}
+
+function idempotencyPath(idempotencyKey: string) {
+  return path.join(
+    lifecycleStorageDirectory,
+    `${idempotencyKey}.idempotency.json`,
+  );
+}
+
+function artifactSha256(serialized: string) {
+  return createHash("sha256").update(serialized).digest("hex");
+}
+
+function assertWorkflowArtifactPrivacy(
+  workflow: SemanticWorkflow,
+  serialized: string,
+) {
+  for (const candidateUrl of [
+    workflow.source.url,
+    workflow.metadata.targetUrl,
+  ]) {
+    const url = new URL(candidateUrl);
+    const safeLegacyFixtureQuery =
+      ["127.0.0.1", "localhost"].includes(url.hostname) &&
+      [...url.searchParams.keys()].every((key) => key === "variant");
+    if (
+      (url.search && !safeLegacyFixtureQuery) ||
+      url.hash ||
+      url.username ||
+      url.password
+    ) {
+      throw new Error("Workflow artifact contains a non-canonical URL.");
+    }
+  }
+  if (
+    /(?:patient_id|mytime|session[_-]?token|bootstrap[_-]?token|popup[_-]?token|frame[_-]?token|bearer\s+)/i.test(
+      serialized,
+    )
+  ) {
+    throw new Error("Workflow artifact failed the sensitive-token scan.");
+  }
+  const forbiddenKeys = new Set([
+    "cookie",
+    "cookies",
+    "localstorage",
+    "sessionstorage",
+    "authorization",
+    "requestheaders",
+    "responseheaders",
+    "capturedvalue",
+    "capturedvalues",
+  ]);
+  const inspectKeys = (value: unknown): void => {
+    if (Array.isArray(value)) {
+      value.forEach(inspectKeys);
+      return;
+    }
+    if (!value || typeof value !== "object") return;
+    for (const [key, child] of Object.entries(value)) {
+      if (forbiddenKeys.has(key.toLowerCase())) {
+        throw new Error("Workflow artifact contains a forbidden field.");
+      }
+      inspectKeys(child);
+    }
+  };
+  inspectKeys(workflow);
+}
+
+async function readWorkflowArtifact(workflowId: string) {
+  const serialized = await readFile(workflowArtifactPath(workflowId), "utf8");
+  const workflow = SemanticWorkflowSchema.parse(JSON.parse(serialized));
+  assertWorkflowArtifactPrivacy(workflow, serialized);
+  return {
+    workflow,
+    serialized,
+    sha256: artifactSha256(serialized),
+  };
+}
 
 function escapeHtml(value: string) {
   return value
@@ -253,8 +396,113 @@ function lifecycleSummary(record: LifecycleRecord) {
   };
 }
 
+function persistedLifecycle(record: LifecycleRecord) {
+  return {
+    version: 1,
+    workflowId: record.workflow.id,
+    artifactPath: artifactLogicalPath(record.workflow.id),
+    artifactSha256: record.artifactSha256,
+    state: record.state,
+    studioProfileId: record.studioProfileId,
+    canonicalUrl: record.canonicalUrl,
+    compilerPayloadSha256: record.compilerPayloadSha256,
+    structuralFingerprint: record.structuralFingerprint,
+    idempotencyKey: record.idempotencyKey,
+    createdAt: record.createdAt,
+    updatedAt: record.updatedAt,
+    validation: record.validation,
+    approvalTimestamp: record.approvalTimestamp,
+    promotion: record.promotion,
+  };
+}
+
+async function writeJsonAtomically(destination: string, value: unknown) {
+  const temporaryPath = `${destination}.${randomUUID()}.tmp.json`;
+  try {
+    await writeFile(temporaryPath, JSON.stringify(value, null, 2), {
+      mode: 0o600,
+    });
+    await rename(temporaryPath, destination);
+  } finally {
+    await rm(temporaryPath, { force: true });
+  }
+}
+
+async function persistLifecycle(record: LifecycleRecord) {
+  record.updatedAt = new Date().toISOString();
+  await writeJsonAtomically(
+    lifecyclePath(record.workflow.id),
+    persistedLifecycle(record),
+  );
+  await writeJsonAtomically(idempotencyPath(record.idempotencyKey), {
+    version: 1,
+    idempotencyKey: record.idempotencyKey,
+    workflowId: record.workflow.id,
+    artifactPath: artifactLogicalPath(record.workflow.id),
+    artifactSha256: record.artifactSha256,
+    updatedAt: record.updatedAt,
+  });
+}
+
+async function loadPersistedLifecycle(workflowId: string) {
+  const parsed = JSON.parse(
+    await readFile(lifecyclePath(workflowId), "utf8"),
+  ) as {
+    state: WorkflowState;
+    studioProfileId: StudioProfileId;
+    canonicalUrl: string;
+    compilerPayloadSha256: string;
+    structuralFingerprint: StructuralFingerprint;
+    idempotencyKey: string;
+    artifactSha256: string;
+    createdAt: string;
+    updatedAt: string;
+    validation?: LifecycleRecord["validation"];
+    approvalTimestamp?: string;
+    promotion?: PromotedWorkflow;
+  };
+  const artifact = await readWorkflowArtifact(workflowId);
+  if (artifact.sha256 !== parsed.artifactSha256) {
+    throw new Error("Persisted workflow hash does not match its artifact.");
+  }
+  const record: LifecycleRecord = {
+    workflow: artifact.workflow,
+    state: WorkflowStateSchema.parse(parsed.state),
+    studioProfileId: StudioProfileIdSchema.parse(parsed.studioProfileId),
+    canonicalUrl: canonicalizeTargetUrl(parsed.canonicalUrl),
+    compilerPayloadSha256: parsed.compilerPayloadSha256,
+    structuralFingerprint: parsed.structuralFingerprint,
+    idempotencyKey: parsed.idempotencyKey,
+    artifactSha256: parsed.artifactSha256,
+    createdAt: parsed.createdAt,
+    updatedAt: parsed.updatedAt,
+    validation: parsed.validation,
+    approvalTimestamp: parsed.approvalTimestamp,
+    promotion: parsed.promotion,
+  };
+  lifecycleRecords.set(workflowId, record);
+  return record;
+}
+
+async function hydrateLifecycleRecords() {
+  await ensureWorkflowStorage();
+  const entries = await readdir(lifecycleStorageDirectory, {
+    withFileTypes: true,
+  });
+  for (const entry of entries) {
+    if (!entry.isFile() || !entry.name.endsWith(".lifecycle.json")) continue;
+    const workflowId = entry.name.slice(0, -".lifecycle.json".length);
+    try {
+      await loadPersistedLifecycle(workflowId);
+    } catch {
+      // Fail closed: invalid or altered state is not made executable.
+    }
+  }
+}
+
 async function ensureWorkflowStorage() {
   await mkdir(WORKFLOW_STORAGE_DIR, { recursive: true });
+  await mkdir(lifecycleStorageDirectory, { recursive: true, mode: 0o700 });
   const seedPath = process.env.E2E_SEED_WORKFLOW_PATH;
   if (seedPath && !existsSync(WORKFLOW_PATH)) {
     await copyFile(path.resolve(seedPath), WORKFLOW_PATH);
@@ -284,7 +532,7 @@ async function openManagedBrowser(profileId: StudioProfileId, target: URL) {
     managedSessions.delete(profileId);
   }
   const browser = await chromium.launch({
-    headless: false,
+    headless: process.env.MANAGED_BROWSER_HEADLESS === "true",
   });
   const context = await browser.newContext({
     serviceWorkers: "block",
@@ -391,9 +639,7 @@ function managedSessionStatus(session: ManagedBrowserSession) {
   };
 }
 
-async function lockManagedBrowserToApplication(
-  session: ManagedBrowserSession,
-) {
+async function lockManagedBrowserToApplication(session: ManagedBrowserSession) {
   const status = managedSessionStatus(session);
   if (!status.canLock) {
     throw new Error("Primary page has not returned to the application origin.");
@@ -440,6 +686,193 @@ async function listWorkflowArtifacts() {
   return workflows
     .filter((workflow) => workflow !== null)
     .sort((a, b) => b.compiledAt.localeCompare(a.compiledAt));
+}
+
+function updateCompilationProgress(
+  requestId: string,
+  stage: CompileProgressStage,
+  options: { complete?: boolean; error?: string } = {},
+) {
+  compilationRequests.set(requestId, {
+    stage,
+    complete: options.complete ?? stage === "Compilation complete",
+    error: options.error,
+    updatedAt: new Date().toISOString(),
+  });
+}
+
+function scheduleCompilationProgressCleanup(requestId: string) {
+  const cleanup = setTimeout(
+    () => compilationRequests.delete(requestId),
+    10 * 60_000,
+  );
+  cleanup.unref();
+}
+
+function summarizedDiagnostics(workflow: SemanticWorkflow) {
+  return {
+    modelCalls: workflow.diagnostics.modelCalls,
+    interpretationSource: workflow.diagnostics.interpretationSource,
+    responseModel: workflow.diagnostics.responseModel,
+    tokenUsage: workflow.diagnostics.tokenUsage,
+    durationMs: workflow.diagnostics.durationMs,
+    rejected: workflow.diagnostics.rejected,
+    stepCount: workflow.steps.length,
+    locatorDiagnostics: workflow.diagnostics.locatorDiagnostics,
+  };
+}
+
+function compactCompileResponse(
+  record: LifecycleRecord,
+  options: { reused: boolean },
+) {
+  return {
+    workflowId: record.workflow.id,
+    artifactPath: artifactLogicalPath(record.workflow.id),
+    lifecycle: { state: record.state },
+    diagnostics: summarizedDiagnostics(record.workflow),
+    reused: options.reused,
+  };
+}
+
+function artifactInstruction(workflow: SemanticWorkflow) {
+  return normalizeInstructionForIdentity(
+    workflow.name.replace(/\s*\[[a-f0-9]{8}\]\s*$/i, ""),
+  );
+}
+
+function validateArtifactAgainstCapture(input: {
+  workflow: SemanticWorkflow;
+  capture: CaptureRecord;
+  studioProfileId: StudioProfileId;
+  canonicalUrl: string;
+  persisted?: LifecycleRecord;
+}) {
+  if (canonicalizeTargetUrl(input.workflow.source.url) !== input.canonicalUrl) {
+    throw new Error("Artifact origin or pathname does not match the capture.");
+  }
+  if (
+    input.persisted &&
+    input.persisted.studioProfileId !== input.studioProfileId
+  ) {
+    throw new Error("Artifact was compiled for a different Training profile.");
+  }
+  const fingerprintCompatibility = input.persisted
+    ? compareStructuralFingerprints(
+        input.persisted.structuralFingerprint,
+        input.capture.fingerprint,
+      )
+    : {
+        compatible: true,
+        score: 1,
+        missingRequired: [] as string[],
+        differencesRedacted: [] as string[],
+      };
+  if (!fingerprintCompatibility.compatible) {
+    throw new Error("Artifact structural fingerprint is not compatible.");
+  }
+  const locatorChecks = input.workflow.steps.map((step) => {
+    const candidates = generateCandidates(input.capture.pageModel, step);
+    const primary = candidates.find(
+      (candidate) => candidate.selector === step.selectedLocator?.primary,
+    );
+    return {
+      stepId: step.id,
+      candidateCount: candidates.length,
+      primaryUnique: primary?.unique === true,
+    };
+  });
+  if (locatorChecks.some((check) => !check.primaryUnique)) {
+    throw new Error(
+      "Artifact restoration refused: a selected locator is missing or ambiguous.",
+    );
+  }
+  return {
+    structuralCompatibility: fingerprintCompatibility.score,
+    locatorChecks,
+  };
+}
+
+async function createDraftRecord(input: {
+  workflow: SemanticWorkflow;
+  capture: CaptureRecord;
+  studioProfileId: StudioProfileId;
+  canonicalUrl: string;
+  idempotencyKey: string;
+  artifactSha256: string;
+}) {
+  const now = new Date().toISOString();
+  const record: LifecycleRecord = {
+    workflow: input.workflow,
+    state: "Draft",
+    captureId: input.capture.id,
+    studioProfileId: input.studioProfileId,
+    canonicalUrl: input.canonicalUrl,
+    compilerPayloadSha256: input.capture.compilerPayloadSha256,
+    structuralFingerprint: input.capture.fingerprint,
+    idempotencyKey: input.idempotencyKey,
+    artifactSha256: input.artifactSha256,
+    createdAt: now,
+    updatedAt: now,
+  };
+  lifecycleRecords.set(input.workflow.id, record);
+  await persistLifecycle(record);
+  return record;
+}
+
+async function findIdempotentDraft(input: {
+  idempotencyKey: string;
+  capture: CaptureRecord;
+  studioProfileId: StudioProfileId;
+  canonicalUrl: string;
+  instruction: string;
+}) {
+  let workflowId: string | undefined;
+  try {
+    const manifest = JSON.parse(
+      await readFile(idempotencyPath(input.idempotencyKey), "utf8"),
+    ) as { workflowId?: string };
+    workflowId = manifest.workflowId;
+  } catch {
+    const entries = await listWorkflowArtifacts();
+    for (const entry of entries) {
+      try {
+        const artifact = await readWorkflowArtifact(entry.id);
+        if (
+          artifactInstruction(artifact.workflow) ===
+            normalizeInstructionForIdentity(input.instruction) &&
+          canonicalizeTargetUrl(artifact.workflow.source.url) ===
+            input.canonicalUrl
+        ) {
+          workflowId = artifact.workflow.id;
+          break;
+        }
+      } catch {
+        // Invalid artifacts are never candidates for reuse.
+      }
+    }
+  }
+  if (!workflowId) return null;
+  const artifact = await readWorkflowArtifact(workflowId);
+  let persisted = lifecycleRecords.get(workflowId);
+  if (!persisted && existsSync(lifecyclePath(workflowId))) {
+    persisted = await loadPersistedLifecycle(workflowId);
+  }
+  validateArtifactAgainstCapture({
+    workflow: artifact.workflow,
+    capture: input.capture,
+    studioProfileId: input.studioProfileId,
+    canonicalUrl: input.canonicalUrl,
+    persisted,
+  });
+  return createDraftRecord({
+    workflow: artifact.workflow,
+    capture: input.capture,
+    studioProfileId: input.studioProfileId,
+    canonicalUrl: input.canonicalUrl,
+    idempotencyKey: input.idempotencyKey,
+    artifactSha256: artifact.sha256,
+  });
 }
 
 function studioHtml() {
@@ -511,6 +944,10 @@ function studioHtml() {
     .report-grid pre { margin-top: 6px; max-height: 220px; }
     .compiler-preview { margin: 14px 0; padding: 12px; border: 1px solid #65bff3; border-radius: 8px; background: #131a22; }
     .compiler-preview pre { max-height: 360px; margin: 8px 0; }
+    .compile-progress { margin: 10px 0; padding-left: 22px; }
+    .compile-progress li { color: #778294; margin: 4px 0; }
+    .compile-progress li.active { color: #f5c451; font-weight: 700; }
+    .compile-progress li.complete { color: #82d49b; }
     input[type="url"] { width: 100%; min-height: 44px; border: 1px solid #3b4555; background: #171b22; color: white; border-radius: 7px; padding: 10px; font-size: 16px; }
     @media (max-width: 980px) {
       .app { grid-template-columns: 1fr; min-height: auto; }
@@ -596,8 +1033,11 @@ function studioHtml() {
           <p class="hint">Only this canonical, classified semantic payload may cross the compiler boundary. Form values, query parameters, storage, cookies, headers and network data are excluded.</p>
           <pre id="compilerPayloadPreview">Capture required.</pre>
           <label><input type="checkbox" id="compilerPayloadConfirmation" disabled> I reviewed this exact redacted payload and confirm that it contains synthetic interface semantics only.</label>
+          <ol class="compile-progress" id="compileProgress" aria-label="Compilation progress"></ol>
           <strong>Locator diagnostics</strong>
           <pre id="locatorDiagnostics">Compilation required.</pre>
+          <label><input type="checkbox" id="restoreArtifactConfirmation" disabled> I confirm restoration of the selected compatible artifact as Draft without GPT.</label>
+          <button type="button" class="secondary" id="restoreDraft" disabled>Restore compatible Draft</button>
         </div>
       </section>
       <section class="mode-panel" id="fixtureLifecyclePanel" aria-label="Fixture workflow lifecycle">
@@ -679,7 +1119,8 @@ OpenAI requests: 0</pre>
       preflight: null,
       targetValid: false,
       authenticationPhase: "idle",
-      canLockAuthentication: false
+      canLockAuthentication: false,
+      compileInFlight: false
     };
     const output = document.getElementById("output");
     const workflowSelect = document.getElementById("workflow");
@@ -690,6 +1131,8 @@ OpenAI requests: 0</pre>
     const attestationInputs = Array.from(document.querySelectorAll("[data-attestation-key]"));
     const indicatorVerified = document.getElementById("indicatorVerified");
     const compilerPayloadConfirmation = document.getElementById("compilerPayloadConfirmation");
+    const restoreArtifactConfirmation = document.getElementById("restoreArtifactConfirmation");
+    const compileStages = ${JSON.stringify(compileProgressStages)};
     const controls = Array.from(document.querySelectorAll("button, select, input, textarea"));
     let targetValidationTimer;
     let authenticationPollTimer;
@@ -714,6 +1157,7 @@ OpenAI requests: 0</pre>
         !state.targetValid ||
         !managedApplicationReady;
       compileButton.disabled =
+        state.compileInFlight ||
         state.profile.mode === "clinical" ||
         !state.profile.compilationAllowed ||
         !attested ||
@@ -721,6 +1165,14 @@ OpenAI requests: 0</pre>
         !managedApplicationReady ||
         !state.capture ||
         !compilerPayloadConfirmation.checked;
+      restoreArtifactConfirmation.disabled =
+        state.compileInFlight ||
+        state.profile.mode === "clinical" ||
+        !state.capture ||
+        !workflowSelect.value;
+      document.getElementById("restoreDraft").disabled =
+        restoreArtifactConfirmation.disabled ||
+        !restoreArtifactConfirmation.checked;
       document.getElementById("lockManagedBrowser").disabled =
         !state.canLockAuthentication ||
         state.authenticationPhase !== "authentication-bootstrap";
@@ -773,8 +1225,11 @@ OpenAI requests: 0</pre>
       state.capture = null;
       compilerPayloadConfirmation.checked = false;
       compilerPayloadConfirmation.disabled = true;
+      restoreArtifactConfirmation.checked = false;
+      restoreArtifactConfirmation.disabled = true;
       document.getElementById("compilerPayloadPreview").textContent = "Capture required.";
       document.getElementById("locatorDiagnostics").textContent = "Compilation required.";
+      document.getElementById("compileProgress").replaceChildren();
       document.getElementById("redactionReport").textContent = "Capture required.";
       document.getElementById("fingerprintReport").textContent = "Capture required.";
       syncJourneyControls();
@@ -922,10 +1377,57 @@ OpenAI requests: 0</pre>
       setStatus("Artifact loaded", "ok");
       render();
     };
+    const summarizedWorkflowDiagnostics = workflow => ({
+      modelCalls: workflow.diagnostics.modelCalls,
+      interpretationSource: workflow.diagnostics.interpretationSource,
+      responseModel: workflow.diagnostics.responseModel,
+      tokenUsage: workflow.diagnostics.tokenUsage,
+      durationMs: workflow.diagnostics.durationMs,
+      rejected: workflow.diagnostics.rejected,
+      locatorDiagnostics: workflow.diagnostics.locatorDiagnostics
+    });
+    const workflowDisplaySummary = workflow => ({
+      workflowId: workflow.id,
+      version: workflow.version,
+      name: workflow.name,
+      source: workflow.source,
+      stepCount: workflow.steps.length,
+      steps: workflow.steps.map(step => ({
+        id: step.id,
+        action: step.action,
+        intent: step.intent,
+        candidateCount: step.candidates.length,
+        selectedLocator: step.selectedLocator,
+        preconditions: step.preconditions,
+        postconditions: step.postconditions
+      })),
+      compiledAt: workflow.compiledAt,
+      compileModel: workflow.compileModel,
+      diagnostics: summarizedWorkflowDiagnostics(workflow)
+    });
+    const fetchJsonWithTimeout = async (url, options = {}, timeoutMs = 30_000) => {
+      const controller = new AbortController();
+      const timer = window.setTimeout(() => controller.abort(), timeoutMs);
+      try {
+        const response = await fetch(url, { ...options, signal: controller.signal });
+        const json = await response.json();
+        if (!response.ok) {
+          throw Object.assign(new Error(json.error ?? "Request failed."), {
+            response: json
+          });
+        }
+        return json;
+      } catch (error) {
+        if (error.name === "AbortError") {
+          throw new Error("Request timed out after " + timeoutMs + " ms.");
+        }
+        throw error;
+      } finally {
+        window.clearTimeout(timer);
+      }
+    };
     const refreshWorkflowList = async preferredId => {
-      const response = await fetch("/api/workflows");
-      if (!response.ok) throw new Error("Unable to list workflow artifacts.");
-      const json = await response.json();
+      const json = await fetchJsonWithTimeout("/api/workflows");
       workflowSelect.replaceChildren(
         ...json.workflows.map(workflow => {
           const option = document.createElement("option");
@@ -942,23 +1444,69 @@ OpenAI requests: 0</pre>
     };
     const loadWorkflow = async workflowId => {
       if (!workflowId) return;
-      const response = await fetch("/api/workflow?id=" + encodeURIComponent(workflowId));
-      if (!response.ok) throw new Error("Unable to load workflow artifact.");
-      applyWorkflow(await response.json());
+      const workflow = await fetchJsonWithTimeout(
+        "/api/workflow?id=" + encodeURIComponent(workflowId)
+      );
+      applyWorkflow(workflow);
+      try {
+        state.lifecycle = (
+          await fetchJsonWithTimeout(
+            "/api/workflow-lifecycle?id=" + encodeURIComponent(workflowId)
+          )
+        ).lifecycle;
+      } catch {
+        state.lifecycle = null;
+      }
+      renderLifecycle();
+      return workflow;
     };
     const render = () => {
       if (!state.workflow) { output.textContent = "No workflow loaded."; return; }
-      if (state.tab === "ir") output.textContent = JSON.stringify(state.workflow, null, 2);
-      if (state.tab === "locators") output.textContent = JSON.stringify(state.workflow.steps.map(s => ({ id: s.id, intent: s.intent, candidates: s.candidates, selectedLocator: s.selectedLocator })), null, 2);
+      if (state.tab === "ir") output.textContent = JSON.stringify(workflowDisplaySummary(state.workflow), null, 2);
+      if (state.tab === "locators") output.textContent = JSON.stringify(state.workflow.steps.map(s => ({ id: s.id, intent: s.intent, candidateCount: s.candidates.length, selectedLocator: s.selectedLocator })), null, 2);
       if (state.tab === "code") output.textContent = state.workflow.generatedPlaywright;
       if (state.tab === "log") output.textContent = JSON.stringify(state.telemetry ?? { message: "Run workflow to collect telemetry." }, null, 2);
       document.querySelectorAll("[data-tab]").forEach(button => button.setAttribute("aria-selected", String(button.dataset.tab === state.tab)));
     };
-    const requestJson = async (url, body) => {
-      const response = await fetch(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
-      const json = await response.json();
-      if (!response.ok) throw Object.assign(new Error(json.error ?? "Request failed."), { response: json });
-      return json;
+    const requestJson = async (url, body, options = {}) => {
+      const timeoutMs = options.timeoutMs ?? 30_000;
+      return fetchJsonWithTimeout(
+        url,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(body)
+        },
+        timeoutMs
+      );
+    };
+    const renderCompileProgress = progress => {
+      const activeIndex = compileStages.indexOf(progress.stage);
+      document.getElementById("compileProgress").replaceChildren(
+        ...compileStages.map((stage, index) => {
+          const item = document.createElement("li");
+          item.textContent = stage;
+          if (progress.complete || index < activeIndex) item.className = "complete";
+          else if (index === activeIndex) item.className = "active";
+          return item;
+        })
+      );
+    };
+    const pollCompileProgress = async requestId => {
+      while (state.compileInFlight) {
+        try {
+          const response = await fetch("/api/compile-status?id=" + encodeURIComponent(requestId));
+          if (response.ok) {
+            const progress = await response.json();
+            renderCompileProgress(progress);
+            setStatus(progress.stage, progress.error ? "error" : "warn");
+            if (progress.complete || progress.error) return;
+          }
+        } catch {
+          // The POST request owns the final timeout/error path.
+        }
+        await new Promise(resolve => window.setTimeout(resolve, 250));
+      }
     };
     document.querySelectorAll("[data-tab]").forEach(btn => btn.addEventListener("click", () => { state.tab = btn.dataset.tab; render(); }));
     document.getElementById("variant").addEventListener("change", event => {
@@ -1003,11 +1551,17 @@ OpenAI requests: 0</pre>
       }
     });
     document.getElementById("compile").addEventListener("click", async () => {
+      if (state.compileInFlight) return;
+      state.compileInFlight = true;
       setBusy(true);
-      setStatus("Compiling");
+      const requestId = crypto.randomUUID();
+      renderCompileProgress({ stage: compileStages[0], complete: false });
+      setStatus(compileStages[0]);
+      void pollCompileProgress(requestId);
       try {
         const variant = document.getElementById("variant").value;
         const json = await requestJson("/api/compile", {
+          requestId,
           instruction: document.getElementById("instruction").value,
           variant,
           studioProfileId: state.profile.id,
@@ -1016,19 +1570,57 @@ OpenAI requests: 0</pre>
           compilerPayloadConfirmed: compilerPayloadConfirmation.checked,
           compilerPayloadSha256: state.capture?.compilerPayloadSha256,
           syntheticAttestation: syntheticAttestation()
-        });
-        await refreshWorkflowList(json.workflow.id);
-        applyWorkflow(json.workflow);
+        }, { timeoutMs: ${COMPILE_RESPONSE_TIMEOUT_MS} });
+        await refreshWorkflowList(json.workflowId);
+        await loadWorkflow(json.workflowId);
         state.lifecycle = json.lifecycle;
         state.preflight = null;
         document.getElementById("locatorDiagnostics").textContent =
-          JSON.stringify(json.workflow.diagnostics.locatorDiagnostics, null, 2);
+          JSON.stringify(json.diagnostics.locatorDiagnostics, null, 2);
+        renderCompileProgress({ stage: "Compilation complete", complete: true });
         renderLifecycle();
-        setStatus("Compiled — Draft", "ok");
+        setStatus(
+          json.reused
+            ? "Compatible artifact restored — Draft"
+            : "Compilation complete — Draft",
+          "ok"
+        );
       } catch (error) {
         setStatus("Failed", "error");
         output.textContent = JSON.stringify(error.response ?? { error: error.message }, null, 2);
       } finally {
+        state.compileInFlight = false;
+        setBusy(false);
+      }
+    });
+    document.getElementById("restoreDraft").addEventListener("click", async () => {
+      if (state.compileInFlight) return;
+      state.compileInFlight = true;
+      setBusy(true);
+      setStatus("Validating artifact compatibility");
+      try {
+        const json = await requestJson("/api/workflows/restore-draft", {
+          workflowId: workflowSelect.value,
+          studioProfileId: state.profile.id,
+          targetUrl: targetUrl.value,
+          captureId: state.capture?.captureId,
+          compilerPayloadSha256: state.capture?.compilerPayloadSha256,
+          restoreConfirmed: restoreArtifactConfirmation.checked,
+          instruction: document.getElementById("instruction").value,
+          syntheticAttestation: syntheticAttestation()
+        });
+        await loadWorkflow(json.workflowId);
+        state.lifecycle = json.lifecycle;
+        state.preflight = null;
+        document.getElementById("locatorDiagnostics").textContent =
+          JSON.stringify(json.diagnostics.locatorDiagnostics, null, 2);
+        renderLifecycle();
+        setStatus("Compatible artifact restored — Draft", "ok");
+      } catch (error) {
+        setStatus("Artifact restoration refused", "error");
+        output.textContent = JSON.stringify(error.response ?? { error: error.message }, null, 2);
+      } finally {
+        state.compileInFlight = false;
         setBusy(false);
       }
     });
@@ -1234,7 +1826,7 @@ OpenAI requests: 0</pre>
         setBusy(false);
       }
     });
-    [...attestationInputs, indicatorVerified, compilerPayloadConfirmation].forEach(input => {
+    [...attestationInputs, indicatorVerified, compilerPayloadConfirmation, restoreArtifactConfirmation].forEach(input => {
       input.addEventListener("change", syncJourneyControls);
     });
     targetUrl.addEventListener("input", () => {
@@ -1267,6 +1859,7 @@ OpenAI requests: 0</pre>
       setStatus(response.ok ? result.status : result.error, response.ok ? "ok" : "error");
     });
     workflowSelect.addEventListener("change", () => {
+      restoreArtifactConfirmation.checked = false;
       loadWorkflow(workflowSelect.value).catch(error => {
         setStatus("Failed", "error");
         output.textContent = JSON.stringify({ error: error.message }, null, 2);
@@ -1399,8 +1992,7 @@ app.post("/api/managed-browser/open", async (req, res) => {
       resolved.url,
     );
     res.json({
-      status:
-        "AUTHENTICATION IN PROGRESS — capture and compilation disabled",
+      status: "AUTHENTICATION IN PROGRESS — capture and compilation disabled",
       profileId: resolved.profile.id,
       mode: resolved.profile.mode,
       ...managedSessionStatus(session),
@@ -1643,16 +2235,14 @@ app.post("/api/capture", async (req, res) => {
         targetUrl: page.url(),
         purpose: "capture",
       });
-      crossOriginFramesExcluded = page
-        .frames()
-        .filter((frame) => {
-          if (frame === page.mainFrame()) return false;
-          try {
-            return new URL(frame.url()).origin !== session.applicationOrigin;
-          } catch {
-            return true;
-          }
-        }).length;
+      crossOriginFramesExcluded = page.frames().filter((frame) => {
+        if (frame === page.mainFrame()) return false;
+        try {
+          return new URL(frame.url()).origin !== session.applicationOrigin;
+        } catch {
+          return true;
+        }
+      }).length;
       pageModel = await extractPageModel(page);
       managedSessionId = session.id;
     } else {
@@ -1699,7 +2289,23 @@ app.post("/api/capture", async (req, res) => {
       .json({ error: error instanceof Error ? error.message : String(error) });
   }
 });
+app.get("/api/compile-status", (req, res) => {
+  const requestId = typeof req.query.id === "string" ? req.query.id : "";
+  const progress = compilationRequests.get(requestId);
+  if (!progress) {
+    res.status(404).json({ error: "Compilation request not found." });
+    return;
+  }
+  res.json(progress);
+});
 app.post("/api/compile", async (req, res) => {
+  const requestId =
+    typeof req.body.requestId === "string" &&
+    /^[a-zA-Z0-9-]{8,80}$/.test(req.body.requestId)
+      ? req.body.requestId
+      : randomUUID();
+  updateCompilationProgress(requestId, "Preparing redacted payload");
+  scheduleCompilationProgressCleanup(requestId);
   const parsedProfileId = StudioProfileIdSchema.safeParse(
     req.body.studioProfileId,
   );
@@ -1750,8 +2356,7 @@ app.post("/api/compile", async (req, res) => {
       (!managedSession || managedSession.phase !== "application-locked")
     ) {
       res.status(423).json({
-        error:
-          "AUTHENTICATION IN PROGRESS — capture and compilation disabled.",
+        error: "AUTHENTICATION IN PROGRESS — capture and compilation disabled.",
       });
       return;
     }
@@ -1795,28 +2400,185 @@ app.post("/api/compile", async (req, res) => {
       ...capture.pageModel,
       url: canonicalizeTargetUrl(capture.pageModel.url),
     };
-    const workflow = await compileWorkflow({
+    const canonicalUrl = canonicalizeTargetUrl(compilerPageModel.url);
+    const idempotencyKey = compileIdempotencyKey({
       instruction,
-      url: compilerPageModel.url,
-      outDir: WORKFLOW_STORAGE_DIR,
-      pageModel: compilerPageModel,
+      studioProfileId: studioProfile.id,
+      canonicalUrl,
+      compilerPayloadSha256: capture.compilerPayloadSha256,
     });
-    const lifecycle: LifecycleRecord = {
-      workflow,
-      state: "Draft",
-      captureId: capture.id,
-    };
-    lifecycleRecords.set(workflow.id, lifecycle);
-    res.json({ workflow, lifecycle: lifecycleSummary(lifecycle) });
+    if (activeCompilationKeys.has(idempotencyKey)) {
+      updateCompilationProgress(requestId, "Preparing redacted payload", {
+        complete: true,
+        error: "An identical compilation is already in progress.",
+      });
+      res.status(409).json({
+        error: "An identical compilation is already in progress.",
+      });
+      return;
+    }
+    activeCompilationKeys.add(idempotencyKey);
+    try {
+      const reusable = await findIdempotentDraft({
+        idempotencyKey,
+        capture,
+        studioProfileId: studioProfile.id,
+        canonicalUrl,
+        instruction,
+      });
+      if (reusable) {
+        updateCompilationProgress(requestId, "Compilation complete", {
+          complete: true,
+        });
+        res.json(compactCompileResponse(reusable, { reused: true }));
+        return;
+      }
+      const workflow = await compileWorkflow({
+        instruction,
+        url: canonicalUrl,
+        outDir: WORKFLOW_STORAGE_DIR,
+        pageModel: compilerPageModel,
+        onProgress: async (stage) => {
+          updateCompilationProgress(requestId, stage);
+          if (compileProgressDelayMs > 0) {
+            await new Promise((resolve) =>
+              setTimeout(resolve, compileProgressDelayMs),
+            );
+          }
+        },
+      });
+      const artifact = await readWorkflowArtifact(workflow.id);
+      const lifecycle = await createDraftRecord({
+        workflow: artifact.workflow,
+        capture,
+        studioProfileId: studioProfile.id,
+        canonicalUrl,
+        idempotencyKey,
+        artifactSha256: artifact.sha256,
+      });
+      updateCompilationProgress(requestId, "Compilation complete", {
+        complete: true,
+      });
+      res.json(compactCompileResponse(lifecycle, { reused: false }));
+    } finally {
+      activeCompilationKeys.delete(idempotencyKey);
+    }
   } catch (error) {
+    const current =
+      compilationRequests.get(requestId)?.stage ?? "Preparing redacted payload";
+    updateCompilationProgress(requestId, current, {
+      complete: true,
+      error: "Compilation failed.",
+    });
     res
       .status(500)
       .json({ error: error instanceof Error ? error.message : String(error) });
   }
 });
-app.get("/api/workflow-lifecycle", (req, res) => {
+app.post("/api/workflows/restore-draft", async (req, res) => {
+  const parsedProfileId = StudioProfileIdSchema.safeParse(
+    req.body.studioProfileId,
+  );
+  if (!parsedProfileId.success) {
+    res.status(400).json({ error: "A valid Training profile is required." });
+    return;
+  }
+  const studioProfile = studioProfiles.find(
+    (candidate) => candidate.id === parsedProfileId.data,
+  )!;
+  if (studioProfile.mode === "clinical" || req.body.restoreConfirmed !== true) {
+    res.status(403).json({
+      error:
+        "Draft restoration requires Training mode and explicit human confirmation.",
+    });
+    return;
+  }
+  let resolved: ReturnType<typeof resolveStudioProfileTarget>;
+  try {
+    resolved = resolveStudioTarget({
+      profileId: studioProfile.id,
+      targetUrl: String(req.body.targetUrl ?? ""),
+      purpose: "compile",
+    });
+    requireValidAttestation(
+      req.body.syntheticAttestation,
+      resolved.applicationProfile,
+    );
+  } catch (error) {
+    res.status(403).json({
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return;
+  }
+  try {
+    const captureId =
+      typeof req.body.captureId === "string" ? req.body.captureId : "";
+    const capture = captures.get(captureId);
+    if (
+      !capture ||
+      capture.studioProfileId !== studioProfile.id ||
+      req.body.compilerPayloadSha256 !== capture.compilerPayloadSha256
+    ) {
+      res.status(409).json({
+        error: "A compatible confirmed capture is required for restoration.",
+      });
+      return;
+    }
+    const workflowId =
+      typeof req.body.workflowId === "string" ? req.body.workflowId : "";
+    const artifact = await readWorkflowArtifact(workflowId);
+    const canonicalUrl = canonicalizeTargetUrl(resolved.url);
+    let persisted = lifecycleRecords.get(workflowId);
+    if (!persisted && existsSync(lifecyclePath(workflowId))) {
+      persisted = await loadPersistedLifecycle(workflowId);
+    }
+    const compatibility = validateArtifactAgainstCapture({
+      workflow: artifact.workflow,
+      capture,
+      studioProfileId: studioProfile.id,
+      canonicalUrl,
+      persisted,
+    });
+    const instruction =
+      typeof req.body.instruction === "string" &&
+      req.body.instruction.trim().length > 0
+        ? req.body.instruction
+        : artifactInstruction(artifact.workflow);
+    const idempotencyKey = compileIdempotencyKey({
+      instruction,
+      studioProfileId: studioProfile.id,
+      canonicalUrl,
+      compilerPayloadSha256: capture.compilerPayloadSha256,
+    });
+    const lifecycle = await createDraftRecord({
+      workflow: artifact.workflow,
+      capture,
+      studioProfileId: studioProfile.id,
+      canonicalUrl,
+      idempotencyKey,
+      artifactSha256: artifact.sha256,
+    });
+    res.json({
+      ...compactCompileResponse(lifecycle, { reused: true }),
+      compatibility,
+    });
+  } catch (error) {
+    res.status(409).json({
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+});
+app.get("/api/workflow-lifecycle", async (req, res) => {
   const workflowId = typeof req.query.id === "string" ? req.query.id : "";
-  const record = lifecycleRecords.get(workflowId);
+  let record = lifecycleRecords.get(workflowId);
+  if (!record && existsSync(lifecyclePath(workflowId))) {
+    try {
+      record = await loadPersistedLifecycle(workflowId);
+    } catch {
+      res.status(409).json({ error: "Persisted lifecycle failed validation." });
+      return;
+    }
+  }
   if (!record) {
     res.status(404).json({ error: "No lifecycle record for this workflow." });
     return;
@@ -1849,6 +2611,7 @@ app.post("/api/workflows/:workflowId/validate", async (req, res) => {
     const passed = variants.every((variant) => variant.passed);
     record.validation = { passed, variants };
     record.state = transitionWorkflow(record.state, "Validated", passed);
+    await persistLifecycle(record);
     res.json({ lifecycle: lifecycleSummary(record) });
   } catch (error) {
     record.validation = { passed: false, variants };
@@ -1858,7 +2621,7 @@ app.post("/api/workflows/:workflowId/validate", async (req, res) => {
     });
   }
 });
-app.post("/api/workflows/:workflowId/approve", (req, res) => {
+app.post("/api/workflows/:workflowId/approve", async (req, res) => {
   const record = lifecycleRecords.get(req.params.workflowId);
   if (!record) {
     res.status(404).json({ error: "Workflow lifecycle record not found." });
@@ -1871,6 +2634,7 @@ app.post("/api/workflows/:workflowId/approve", (req, res) => {
   try {
     record.state = transitionWorkflow(record.state, "Approved");
     record.approvalTimestamp = new Date().toISOString();
+    await persistLifecycle(record);
     res.json({ lifecycle: lifecycleSummary(record) });
   } catch (error) {
     res
@@ -1878,13 +2642,13 @@ app.post("/api/workflows/:workflowId/approve", (req, res) => {
       .json({ error: error instanceof Error ? error.message : String(error) });
   }
 });
-app.post("/api/workflows/:workflowId/promote", (req, res) => {
+app.post("/api/workflows/:workflowId/promote", async (req, res) => {
   const record = lifecycleRecords.get(req.params.workflowId);
   if (!record) {
     res.status(404).json({ error: "Workflow lifecycle record not found." });
     return;
   }
-  const capture = captures.get(record.captureId);
+  const capture = record.captureId ? captures.get(record.captureId) : undefined;
   if (!capture || !record.validation?.passed || !record.approvalTimestamp) {
     res.status(409).json({
       error:
@@ -1937,6 +2701,7 @@ app.post("/api/workflows/:workflowId/promote", (req, res) => {
       ...unsigned,
       workflowSha256: computeWorkflowHash(unsigned),
     };
+    await persistLifecycle(record);
     res.json({ lifecycle: lifecycleSummary(record) });
   } catch (error) {
     res
@@ -2033,7 +2798,7 @@ app.post("/api/workflows/:workflowId/run-promoted", async (req, res) => {
       .json({ error: error instanceof Error ? error.message : String(error) });
   }
 });
-app.post("/api/workflows/:workflowId/revoke", (req, res) => {
+app.post("/api/workflows/:workflowId/revoke", async (req, res) => {
   const record = lifecycleRecords.get(req.params.workflowId);
   if (!record) {
     res.status(404).json({ error: "Workflow lifecycle record not found." });
@@ -2041,6 +2806,7 @@ app.post("/api/workflows/:workflowId/revoke", (req, res) => {
   }
   try {
     record.state = transitionWorkflow(record.state, "Revoked");
+    await persistLifecycle(record);
     res.json({ lifecycle: lifecycleSummary(record) });
   } catch (error) {
     res
@@ -2089,14 +2855,14 @@ app.get("/api/workflow", async (req, res) => {
   try {
     const workflowId =
       typeof req.query.id === "string" ? req.query.id : defaultWorkflowId;
-    res.json(
-      JSON.parse(await readFile(workflowArtifactPath(workflowId), "utf8")),
-    );
+    const artifact = await readWorkflowArtifact(workflowId);
+    res.json(artifact.workflow);
   } catch {
     res.status(404).json({ error: "No compiled workflow yet." });
   }
 });
 
+await hydrateLifecycleRecords();
 const server = app.listen(port, host, () =>
   console.log(`Studio listening on http://${host}:${port}`),
 );

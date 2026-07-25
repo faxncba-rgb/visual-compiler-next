@@ -28,6 +28,7 @@ Synthetic training application
 - Page-model redaction excluding values, storage, cookies, network data, sensitive URL parameters, and sensitive nodes.
 - Classified semantic compiler payload retaining only control names, associated labels, generic placeholders/control text, nearby structural headings, geometry and DOM/visual relations.
 - Exact redacted-payload preview plus mandatory human confirmation before any Training compilation.
+- Compact compile acknowledgements followed by explicit artifact loading, visible stage progress, bounded requests, concurrent-call refusal, and idempotent artifact reuse.
 - Data-independent structural fingerprints and redacted compatibility differences.
 - `Draft → Validated → Approved → Promoted → Revoked` lifecycle with immutable SHA-256 verification.
 - Fail-closed clinical preflight, redacted audit structures, and ephemeral runtime parameters.
@@ -52,7 +53,7 @@ The NCBA training profile allows any HTTPS pathname and dynamic query string on 
 
 On the local fixture, Studio visibly demonstrates the complete milestone: redacted capture, mock compilation, `Draft → Validated → Approved → Promoted`, structural preflight, and promoted execution on variants A and B. Redaction counts, the structural SHA-256, planned actions, preflight result, and zero-call runtime telemetry remain visible. `Revoked` is also exposed and immediately closes promoted execution.
 
-The Studio is a first professional MVP: lifecycle orchestration is in memory for this milestone, while durable approval records and authorized clinical browser integration remain future work. Ed25519 signing is deferred; promoted artifacts use verified SHA-256.
+Draft and subsequent lifecycle state are persisted locally in restricted sidecars containing hashes, canonical URLs, structural fingerprints, profile identifiers, and timestamps but no browser or medical data. Studio restores validated sidecars on restart and can rebind a compatible artifact to a fresh confirmed capture without GPT. Artifact bytes remain immutable and are loaded separately through `GET /api/workflow`; the compile POST returns only identifiers, lifecycle state, and summarized diagnostics. Ed25519 signing is deferred; promoted artifacts use verified SHA-256.
 
 ## Local use
 
@@ -73,6 +74,8 @@ CI and tests use local fixtures only. They require no OpenAI key and never conta
 The SSO regression test uses two loopback origins: a synthetic application and a synthetic identity provider. Its HTTP exception is available only when `ALLOW_EXPLICIT_LOCAL_SSO_FIXTURE=true` and the configured application origin is loopback. Production profiles remain HTTPS-only.
 
 The local `/cgi-professional` fixture intentionally contains multiple textareas and multiple **Enregistrer** buttons without `data-vc-stable-label`. Its offline test instruction compiles through ranked accessibility, label, DOM and spatial candidates, then replays locally with zero OpenAI calls. The fixture contains only conspicuously synthetic values used to prove that field contents and query parameters never enter the compiler payload or artifact.
+
+The same fixture accepts the test-only `large=1` query to create more than 100 KB of deterministic locator candidates. E2E verifies a compact POST response, separate GET loading, idempotent reuse, concurrent-call refusal, lifecycle recovery after an actual Studio process restart, and human-confirmed Draft restoration. The Studio renders only a bounded artifact summary and candidate counts, never the complete artifact.
 
 To exercise the visible fixture journey, open Studio, keep `ncba-dpi-fixture`, check every synthetic attestation statement and the local marker, then use **Capture**, **Compile**, **Validate A/B**, **Approve**, **Promote**, **Run preflight**, and **Execute promoted A/B** in order.
 

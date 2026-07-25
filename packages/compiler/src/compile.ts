@@ -25,6 +25,15 @@ export type CompileOptions = {
   headless?: boolean;
   pageModel?: PageModel;
   interpreter?: typeof interpretInstruction;
+  onProgress?: (
+    stage:
+      | "Preparing redacted payload"
+      | "Calling GPT-5.6"
+      | "Validating Semantic IR"
+      | "Generating locators"
+      | "Saving artifact"
+      | "Compilation complete",
+  ) => void | Promise<void>;
 };
 
 export function createWorkflowIdentity(
@@ -55,6 +64,7 @@ export async function compileWorkflow(
     throw new Error("Specify either outPath or outDir, not both.");
   }
   const started = Date.now();
+  await options.onProgress?.("Preparing redacted payload");
   const identity = createWorkflowIdentity(options.instruction);
   let pageModel = options.pageModel;
   if (!pageModel) {
@@ -77,10 +87,13 @@ export async function compileWorkflow(
     url: canonicalUrl,
   };
 
+  await options.onProgress?.("Calling GPT-5.6");
   const interpretation = await (options.interpreter ?? interpretInstruction)(
     options.instruction,
     compilerPageModel,
   );
+  await options.onProgress?.("Validating Semantic IR");
+  await options.onProgress?.("Generating locators");
   const locatorDiagnostics: Array<{
     stepId: string;
     candidateCount: number;
@@ -185,6 +198,7 @@ export async function compileWorkflow(
     ? path.join(options.outDir, `${workflow.id}.json`)
     : options.outPath;
   if (artifactPath) {
+    await options.onProgress?.("Saving artifact");
     await mkdir(path.dirname(artifactPath), { recursive: true });
     const temporaryPath = path.join(
       path.dirname(artifactPath),
@@ -204,6 +218,7 @@ export async function compileWorkflow(
       await rm(temporaryPath, { force: true });
     }
   }
+  await options.onProgress?.("Compilation complete");
   return workflow;
 }
 

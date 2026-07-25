@@ -20,9 +20,7 @@ test("a CGI-style page without stable test labels compiles textarea and Save loc
   await expect(page.locator("#targetValidation")).not.toContainText(
     "patient_id",
   );
-  await page
-    .getByLabel("Workflow instruction")
-    .fill(CGI_FIXTURE_INSTRUCTION);
+  await page.getByLabel("Workflow instruction").fill(CGI_FIXTURE_INSTRUCTION);
   for (const checkbox of await page
     .locator("[data-attestation-key], #indicatorVerified")
     .all()) {
@@ -122,11 +120,43 @@ test("a CGI-style page without stable test labels compiles textarea and Save loc
   await expect(page.getByRole("button", { name: "Compile" })).toBeDisabled();
   await page.locator("#compilerPayloadConfirmation").check();
   await expect(page.getByRole("button", { name: "Compile" })).toBeEnabled();
+  const compactCompileResponsePromise = page.waitForResponse(
+    (response) =>
+      response.url() === `${studioOrigin}/api/compile` &&
+      response.request().method() === "POST",
+  );
   await page.getByRole("button", { name: "Compile" }).click();
-  await expect(page.locator("#status")).toHaveText("Compiled — Draft");
-
-  const workflow = SemanticWorkflowSchema.parse(
-    JSON.parse(await page.locator("#output").innerText()),
+  await expect(page.locator("#status")).toContainText("Draft");
+  const compactResponse = await compactCompileResponsePromise;
+  const compactText = await compactResponse.text();
+  const compactBody = JSON.parse(compactText);
+  expect(Buffer.byteLength(compactText)).toBeLessThan(10_000);
+  expect(compactBody).toMatchObject({
+    workflowId: expect.any(String),
+    artifactPath: expect.stringContaining("compiled-workflows/"),
+    lifecycle: { state: "Draft" },
+    diagnostics: {
+      modelCalls: 0,
+      locatorDiagnostics: expect.any(Array),
+    },
+  });
+  expect(compactBody.workflow).toBeUndefined();
+  const artifactResponse = await page.request.get(
+    `${studioOrigin}/api/workflow?id=${encodeURIComponent(compactBody.workflowId)}`,
+  );
+  expect(artifactResponse.ok()).toBe(true);
+  const workflow = SemanticWorkflowSchema.parse(await artifactResponse.json());
+  const studioSummary = JSON.parse(await page.locator("#output").innerText());
+  expect(studioSummary).toMatchObject({
+    workflowId: workflow.id,
+    stepCount: 2,
+  });
+  expect(studioSummary.steps[0].candidates).toBeUndefined();
+  await expect(page.locator("#compileProgress")).toContainText(
+    "Preparing redacted payload",
+  );
+  await expect(page.locator("#compileProgress")).toContainText(
+    "Compilation complete",
   );
   expect(workflow.steps.map((step) => step.action)).toEqual(["fill", "click"]);
   expect(workflow.steps[0].target.accessibleName).toBe(
