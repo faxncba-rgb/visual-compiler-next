@@ -16,4 +16,6 @@ Studio exposes exactly three managed selections:
 
 Changing the selection updates labels and URL fields only. It performs no navigation or background request. The NCBA origin is opened only by the explicit **Open in managed browser** action and confirmation.
 
-For `ncba-dpi-training`, allowlisting compares `new URL(target).origin` with the configured origin. HTTPS path and query changes on that exact origin are accepted, while sibling subdomains, HTTP, credential-bearing URLs, forbidden schemes, and cross-origin redirects remain rejected. Query strings are memory-only and are removed before compiler input, artifacts, fingerprints, and audits.
+For `ncba-dpi-training`, allowlisting compares `new URL(target).origin` with the configured origin. HTTPS path and query changes on that exact origin are accepted, while sibling subdomains, HTTP, credential-bearing URLs, and forbidden schemes remain rejected.
+
+After explicit opening, `AUTHENTICATION BOOTSTRAP` temporarily accepts HTTPS SSO redirects and popups without creating any capture or compiler input. The operator authenticates manually. Locking is refused until the primary page returns to the exact application origin. After the visible **Authentication complete — lock to application** action, `APPLICATION LOCKED` enforces that origin for primary-page navigation. Query strings remain memory-only and are removed before diagnostics, compiler input, artifacts, fingerprints, and audits.

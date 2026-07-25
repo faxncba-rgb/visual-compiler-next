@@ -9,6 +9,9 @@
 - Added fixture-only tests proving profile selection makes no NCBA request.
 - Allowed dynamic same-origin NCBA training paths and query parameters while canonicalizing compiler, artifact, fingerprint, and audit URLs to `origin + pathname`.
 - Added attestation-gated managed-browser opening, local target validation, and Playwright cross-origin navigation blocking.
+- Added an explicit `AUTHENTICATION BOOTSTRAP → APPLICATION LOCKED` managed-browser flow for manual SSO.
+- Kept capture and compilation closed during bootstrap, added an exact-origin human lock, and resumed strict primary-navigation enforcement after lock.
+- Added a two-origin synthetic SSO fixture covering redirect, popup, cross-origin iframe exclusion, query/token redaction, OpenAI blocking, and post-lock escape blocking.
 
 ## 0.2.0 — 2026-07-22
 

@@ -9,6 +9,25 @@ import {
 import { runPromotedWorkflowObject } from "@visual-compiler/runtime";
 import { SemanticWorkflowSchema } from "@visual-compiler/semantic-ir";
 
+const studioOrigin = "http://127.0.0.1:3100";
+const syntheticApplicationOrigin = "http://127.0.0.1:4273";
+
+function completeSyntheticAttestation() {
+  return {
+    profileId: "ncba-dpi",
+    statements: {
+      authorizedTrainingEnvironment: true,
+      syntheticDataOnly: true,
+      noRealPatientDataVisible: true,
+      noCredentialOrSecretSentToOpenAI: true,
+      administrativeAndReversible: true,
+    },
+    syntheticIndicator: "training-banner",
+    indicatorVerifiedLocally: true,
+    attestedAt: new Date().toISOString(),
+  };
+}
+
 test("synthetic fixture exposes training and clinical variants without contacting the DPI", async ({
   page,
 }) => {
@@ -171,7 +190,7 @@ test("Studio visibly demonstrates capture through promoted A/B execution", async
   );
 });
 
-test("profile selection never contacts NCBA and compilation is attestation-gated", async ({
+test("profile selection performs no navigation and compilation is attestation-gated", async ({
   page,
 }) => {
   const ncbaRequests: string[] = [];
@@ -196,7 +215,7 @@ test("profile selection never contacts NCBA and compilation is attestation-gated
   );
   await expect(page.locator("#activeMode")).toHaveText("TRAINING");
   await expect(page.getByLabel("Target Website URL")).toHaveValue(
-    "https://dpi-ncba.gbna-sante.fr/",
+    `${syntheticApplicationOrigin}/`,
   );
   await expect(page.getByTitle("Controlled workflow demo")).toHaveAttribute(
     "srcdoc",
@@ -206,11 +225,11 @@ test("profile selection never contacts NCBA and compilation is attestation-gated
   expect(ncbaRequests).toEqual([]);
 
   const dynamicTrainingUrl =
-    "https://dpi-ncba.gbna-sante.fr/saisie/consultations.cgi?patient_id=FAKE-E2E&mytime=123456";
+    `${syntheticApplicationOrigin}/sso-app/start?patient_id=FAKE-E2E&mytime=123456`;
   await page.getByLabel("Target Website URL").fill(dynamicTrainingUrl);
   await page.getByLabel("Target Website URL").press("Tab");
   await expect(page.locator("#targetValidation")).toContainText(
-    "Target accepted: https://dpi-ncba.gbna-sante.fr/saisie/consultations.cgi",
+    `Target accepted: ${syntheticApplicationOrigin}/sso-app/start`,
   );
   await expect(page.locator("#targetValidation")).not.toContainText(
     "patient_id",
@@ -241,8 +260,8 @@ test("profile selection never contacts NCBA and compilation is attestation-gated
   const localValidationBody = await localValidation.json();
   expect(localValidationBody).toEqual({
     accepted: true,
-    origin: "https://dpi-ncba.gbna-sante.fr",
-    canonicalUrl: "https://dpi-ncba.gbna-sante.fr/saisie/consultations.cgi",
+    origin: syntheticApplicationOrigin,
+    canonicalUrl: `${syntheticApplicationOrigin}/sso-app/start`,
     queryParametersDiscarded: true,
   });
   expect(JSON.stringify(localValidationBody)).not.toContain("FAKE-E2E");
@@ -252,7 +271,7 @@ test("profile selection never contacts NCBA and compilation is attestation-gated
     {
       data: {
         studioProfileId: "ncba-dpi-training",
-        targetUrl: "https://dpi-ncba.gbna-sante.fr/",
+        targetUrl: `${syntheticApplicationOrigin}/`,
         instruction: "Synthetic administrative test",
       },
     },
@@ -264,7 +283,7 @@ test("profile selection never contacts NCBA and compilation is attestation-gated
     {
       data: {
         studioProfileId: "ncba-dpi-training",
-        targetUrl: "https://dpi-ncba.gbna-sante.fr/",
+        targetUrl: `${syntheticApplicationOrigin}/`,
         explicitUserAction: false,
       },
     },
@@ -292,27 +311,15 @@ test("profile selection never contacts NCBA and compilation is attestation-gated
     {
       data: {
         studioProfileId: "ncba-dpi-training",
-        targetUrl: "https://dpi-ncba.gbna-sante.fr/",
+        targetUrl: `${syntheticApplicationOrigin}/`,
         instruction: "Synthetic administrative test",
-        syntheticAttestation: {
-          profileId: "ncba-dpi",
-          statements: {
-            authorizedTrainingEnvironment: true,
-            syntheticDataOnly: true,
-            noRealPatientDataVisible: true,
-            noCredentialOrSecretSentToOpenAI: true,
-            administrativeAndReversible: true,
-          },
-          syntheticIndicator: "training-banner",
-          indicatorVerifiedLocally: true,
-          attestedAt: new Date().toISOString(),
-        },
+        syntheticAttestation: completeSyntheticAttestation(),
       },
     },
   );
-  expect(completeAttestation.status()).toBe(409);
+  expect(completeAttestation.status()).toBe(423);
   expect(await completeAttestation.json()).toMatchObject({
-    error: expect.stringContaining("fresh attested capture"),
+    error: expect.stringContaining("AUTHENTICATION IN PROGRESS"),
   });
 
   const clinicalCompile = await page.request.post(
@@ -320,7 +327,7 @@ test("profile selection never contacts NCBA and compilation is attestation-gated
     {
       data: {
         studioProfileId: "ncba-dpi-clinical",
-        targetUrl: "https://dpi-ncba.gbna-sante.fr/",
+        targetUrl: `${syntheticApplicationOrigin}/`,
       },
     },
   );
@@ -329,6 +336,181 @@ test("profile selection never contacts NCBA and compilation is attestation-gated
     error: expect.stringContaining("disabled in clinical"),
   });
   expect(ncbaRequests).toEqual([]);
+});
+
+test("managed Training completes synthetic popup SSO before strict application lock", async ({
+  page,
+}) => {
+  test.setTimeout(90_000);
+  const forbiddenValues = [
+    "FAKE-E2E-SSO",
+    "patient_id",
+    "mytime",
+    "session_token",
+    "bootstrap_token",
+    "popup_token",
+    "frame_token",
+    "SYNTHETIC-RETURN-TOKEN",
+    "SYNTHETIC-BOOTSTRAP-TOKEN",
+    "SYNTHETIC-POPUP-TOKEN",
+    "SYNTHETIC-FRAME-TOKEN",
+  ];
+  const dynamicTarget =
+    `${syntheticApplicationOrigin}/sso-app/start?patient_id=FAKE-E2E-SSO&mytime=987654`;
+
+  await page.goto(studioOrigin);
+  await page
+    .getByLabel("Application profile", { exact: true })
+    .selectOption("ncba-dpi-training");
+  await page.getByLabel("Target Website URL").fill(dynamicTarget);
+  await page.getByLabel("Target Website URL").press("Tab");
+  await expect(page.locator("#targetValidation")).toContainText(
+    `${syntheticApplicationOrigin}/sso-app/start`,
+  );
+  await expect(page.locator("#targetValidation")).not.toContainText(
+    "patient_id",
+  );
+
+  for (const checkbox of await page
+    .locator("[data-attestation-key], #indicatorVerified")
+    .all()) {
+    await checkbox.check();
+  }
+  page.once("dialog", (dialog) => dialog.accept());
+  await page
+    .getByRole("button", { name: "Open in managed browser" })
+    .click();
+  await expect(page.locator("#authenticationState")).toContainText(
+    "AUTHENTICATION IN PROGRESS",
+    { timeout: 15_000 },
+  );
+  await expect
+    .poll(async () => {
+      const response = await page.request.get(
+        `${studioOrigin}/api/managed-browser/status/ncba-dpi-training`,
+      );
+      const body = await response.json();
+      return {
+        phase: body.phase,
+        currentOrigin: body.currentOrigin,
+      };
+    })
+    .toEqual({
+      phase: "authentication-bootstrap",
+      currentOrigin: "http://127.0.0.1:4275",
+    });
+  await expect(page.getByRole("button", { name: "Capture" })).toBeDisabled();
+  await expect(page.getByRole("button", { name: "Compile" })).toBeDisabled();
+
+  const captureDuringAuthentication = await page.request.post(
+    `${studioOrigin}/api/capture`,
+    {
+      data: {
+        studioProfileId: "ncba-dpi-training",
+        targetUrl: dynamicTarget,
+        syntheticAttestation: completeSyntheticAttestation(),
+      },
+    },
+  );
+  expect(captureDuringAuthentication.status()).toBe(423);
+  const compileDuringAuthentication = await page.request.post(
+    `${studioOrigin}/api/compile`,
+    {
+      data: {
+        studioProfileId: "ncba-dpi-training",
+        targetUrl: dynamicTarget,
+        syntheticAttestation: completeSyntheticAttestation(),
+      },
+    },
+  );
+  expect(compileDuringAuthentication.status()).toBe(423);
+
+  const earlyLock = await page.request.post(
+    `${studioOrigin}/api/managed-browser/lock`,
+    {
+      data: {
+        studioProfileId: "ncba-dpi-training",
+        explicitUserAction: true,
+      },
+    },
+  );
+  expect(earlyLock.status()).toBe(409);
+  expect(JSON.stringify(await earlyLock.json())).not.toContain("return_to");
+
+  const openAiProbe = await page.request.post(
+    `${studioOrigin}/api/test-only/sso/probe-openai-block`,
+  );
+  expect(await openAiProbe.json()).toEqual({
+    blocked: true,
+    llmCalls: 0,
+    openAIRequests: 0,
+  });
+
+  const continuation = await page.request.post(
+    `${studioOrigin}/api/test-only/sso/continue`,
+    { data: { flow: "popup" } },
+  );
+  expect(continuation.status()).toBe(200);
+  const continuationBody = await continuation.json();
+  expect(continuationBody).toMatchObject({
+    phase: "authentication-bootstrap",
+    currentOrigin: syntheticApplicationOrigin,
+    canLock: true,
+    llmCalls: 0,
+    openAIRequests: 0,
+  });
+  expect(JSON.stringify(continuationBody)).not.toContain("token");
+
+  const lockButton = page.getByRole("button", {
+    name: "Authentication complete — lock to application",
+  });
+  await expect(lockButton).toBeEnabled();
+  await lockButton.click();
+  await expect(page.locator("#authenticationState")).toContainText(
+    "APPLICATION LOCKED",
+  );
+  await expect(page.getByRole("button", { name: "Capture" })).toBeEnabled();
+
+  await page.getByRole("button", { name: "Capture" }).click();
+  await expect(page.locator("#status")).toHaveText("Redacted capture ready");
+  await expect(page.locator("#redactionReport")).toContainText(
+    '"cookiesCaptured": false',
+  );
+  const captureReportText = await page.locator("#redactionReport").innerText();
+  for (const forbidden of forbiddenValues) {
+    expect(captureReportText).not.toContain(forbidden);
+  }
+
+  await page.getByRole("button", { name: "Compile" }).click();
+  await expect(page.locator("#status")).toHaveText("Compiled — Draft", {
+    timeout: 15_000,
+  });
+  const artifactText = await page.locator("#output").innerText();
+  expect(artifactText).toContain(
+    `${syntheticApplicationOrigin}/sso-app/callback`,
+  );
+  for (const forbidden of forbiddenValues) {
+    expect(artifactText).not.toContain(forbidden);
+  }
+
+  const exitAttempt = await page.request.post(
+    `${studioOrigin}/api/test-only/sso/attempt-exit`,
+  );
+  const exitBody = await exitAttempt.json();
+  expect(exitBody).toMatchObject({
+    blocked: true,
+    phase: "application-locked",
+    currentOrigin: syntheticApplicationOrigin,
+    llmCalls: 0,
+    openAIRequests: 0,
+  });
+  for (const forbidden of forbiddenValues) {
+    expect(JSON.stringify(exitBody)).not.toContain(forbidden);
+  }
+
+  await page.request.delete(
+    `${studioOrigin}/api/browser-profiles/ncba-dpi-training`,
+  );
 });
 
 test("a promoted synthetic workflow executes on variants A and B with zero OpenAI calls", async () => {

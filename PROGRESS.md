@@ -1,5 +1,16 @@
 # Progress
 
+## 2026-07-25 — Manual SSO bootstrap and application lock
+
+- Added visible `AUTHENTICATION IN PROGRESS — capture and compilation disabled` and `APPLICATION LOCKED` states to Studio.
+- Added the explicit **Authentication complete — lock to application** action, accepted only when the primary page has returned to the configured application origin.
+- Managed Training now uses an ephemeral, memory-only Playwright context. HTTPS authentication redirects, popups, iframes, and subresources are allowed during bootstrap; unsafe schemes and OpenAI domains remain blocked.
+- After locking, strict origin policy applies to primary-page navigation. Cross-origin iframes may render but are excluded from capture.
+- Added a local two-origin SSO fixture and E2E coverage for redirect, popup, premature capture/compile refusal, wrong-origin lock refusal, successful return/lock, redacted compilation, post-lock escape blocking, and zero OpenAI calls.
+- Final validation: `npm ci`, build, 42/42 unit and integration tests, 8/8 focused security tests plus a 76-file scan, and 11/11 Playwright E2E tests.
+- Visual loopback verification completed through popup SSO, application lock, redacted capture, and offline mock compilation; the resulting visible artifact contained the canonical callback path and no query parameter or token.
+- No NCBA domain, patient data, credential, or OpenAI service was contacted. The real DPI remains untested.
+
 ## 2026-07-25 — Dynamic training URLs with canonical privacy boundary
 
 - NCBA training target validation now compares the exact HTTPS origin and accepts dynamic paths and query parameters on that origin.

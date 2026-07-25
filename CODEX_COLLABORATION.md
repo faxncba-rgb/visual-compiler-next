@@ -10,6 +10,8 @@ The 2026-07-23 validation completed with build success, 36/36 tests, the focused
 
 For the 2026-07-24 managed-profile milestone, Codex presents implementation and test results before publication, then commits and pushes only after the user's explicit instruction. Automated coverage may select the NCBA profile in Studio but must assert that no request reaches its domain; it must never click the external managed-browser action.
 
+For the 2026-07-25 SSO milestone, automated and visual validation uses only a loopback application plus a separate loopback identity-provider fixture. `USE_LIVE_OPENAI=false` is enforced for Playwright Studio, so the live compiler branch is unreachable even if a developer has a local ignored environment file. The real NCBA origin is not opened, authentication data is not observed, and only canonical origins/pathnames may appear in diagnostics or artifacts.
+
 ## Components Codex Designed
 
 - Monorepo structure separating compile-time and runtime packages.

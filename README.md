@@ -36,13 +36,15 @@ Synthetic training application
 
 ## Managed application profiles
 
-Studio starts on `ncba-dpi-fixture`. The target URL is constrained by the selected profile. `ncba-dpi-training` and `ncba-dpi-clinical` show the configured NCBA origin but do not contact it when selected. Only the explicit **Open in managed browser** action can open that origin, in a visible isolated Playwright profile after an additional confirmation.
+Studio starts on `ncba-dpi-fixture`. The target URL is constrained by the selected profile. `ncba-dpi-training` and `ncba-dpi-clinical` show the configured NCBA origin but do not contact it when selected. Only the explicit **Open in managed browser** action can open that origin, in a visible ephemeral Playwright context after an additional confirmation.
 
 Training capture and compilation require every synthetic-environment attestation statement plus a locally verified synthetic marker. The backend returns `403` before capture when attestation is missing or expired. External training compilation can use only the page already opened manually in its managed browser. Clinical mode hides training controls and rejects compilation and compiler-oriented capture at the policy layer.
 
 The compiler boundary receives structural fields and explicitly marked stable labels only. It does not receive cookies, authentication tokens, input or textarea values, contenteditable values, browser storage, headers, form payloads, or network responses.
 
-The NCBA training profile allows any HTTPS pathname and dynamic query string on the exact configured origin. The full URL exists only in the managed-browser navigation call and in-memory capture. Before compiler input, persistence, fingerprinting, or audit output, it is canonicalized to `origin + pathname`; all query parameters and fragments are discarded. Main-frame redirects to a different origin are blocked.
+The managed Training flow has two explicit phases. During **AUTHENTICATION BOOTSTRAP**, temporary HTTPS redirects, popups, iframe navigation, and subresources may cross origins so the user can authenticate manually. Capture and compilation stay technically disabled, OpenAI domains and unsafe schemes remain blocked, and Studio displays only the current origin. When the primary page returns to the exact configured application origin, the user must choose **Authentication complete — lock to application**. **APPLICATION LOCKED** then rejects main-page navigation away from that origin while allowing required HTTPS subresources and iframes; cross-origin frames are excluded from capture.
+
+The NCBA training profile allows any HTTPS pathname and dynamic query string on the exact configured origin. The full URL exists only in memory for browser navigation. Before compiler input, persistence, fingerprinting, audit output, or diagnostics, it is canonicalized to `origin + pathname`; all query parameters and fragments are discarded. Authentication origins are never written to workflow artifacts.
 
 On the local fixture, Studio visibly demonstrates the complete milestone: redacted capture, mock compilation, `Draft → Validated → Approved → Promoted`, structural preflight, and promoted execution on variants A and B. Redaction counts, the structural SHA-256, planned actions, preflight result, and zero-call runtime telemetry remain visible. `Revoked` is also exposed and immediately closes promoted execution.
 
@@ -63,6 +65,8 @@ Studio: `http://127.0.0.1:3000`
 Synthetic fixture: `http://127.0.0.1:4173/ncba-fixture?mode=training&variant=A`
 
 CI and tests use local fixtures only. They require no OpenAI key and never contact the NCBA DPI.
+
+The SSO regression test uses two loopback origins: a synthetic application and a synthetic identity provider. Its HTTP exception is available only when `ALLOW_EXPLICIT_LOCAL_SSO_FIXTURE=true` and the configured application origin is loopback. Production profiles remain HTTPS-only.
 
 To exercise the visible fixture journey, open Studio, keep `ncba-dpi-fixture`, check every synthetic attestation statement and the local marker, then use **Capture**, **Compile**, **Validate A/B**, **Approve**, **Promote**, **Run preflight**, and **Execute promoted A/B** in order.
 

@@ -10,14 +10,22 @@ export default defineConfig({
   },
   webServer: [
     {
-      command: "DEMO_PORT=4273 npm run dev:demo",
+      command:
+        "SSO_FIXTURE_PORT=4275 npm run dev:sso-fixture",
+      url: "http://127.0.0.1:4275/health",
+      reuseExistingServer: false,
+      timeout: 30_000,
+    },
+    {
+      command:
+        "DEMO_PORT=4273 SSO_AUTH_ORIGIN=http://127.0.0.1:4275 npm run dev:demo",
       url: "http://127.0.0.1:4273/health",
       reuseExistingServer: false,
       timeout: 30_000,
     },
     {
       command:
-        "STUDIO_PORT=3100 DEMO_SITE_INTERNAL_URL=http://127.0.0.1:4273 DEMO_SITE_PUBLIC_URL=http://127.0.0.1:4273 WORKFLOW_STORAGE_DIR=/private/tmp/visual-compiler-next-e2e-workflows E2E_SEED_WORKFLOW_PATH=compiled-workflows/pending-review.workflow.json npm run dev:studio",
+        "USE_LIVE_OPENAI=false STUDIO_PORT=3100 DEMO_SITE_INTERNAL_URL=http://127.0.0.1:4273 DEMO_SITE_PUBLIC_URL=http://127.0.0.1:4273 NCBA_TRAINING_ORIGIN=http://127.0.0.1:4273 ALLOW_EXPLICIT_LOCAL_SSO_FIXTURE=true SSO_FIXTURE_AUTH_ORIGIN=http://127.0.0.1:4275 WORKFLOW_STORAGE_DIR=/private/tmp/visual-compiler-next-e2e-workflows E2E_SEED_WORKFLOW_PATH=compiled-workflows/pending-review.workflow.json npm run dev:studio",
       url: "http://127.0.0.1:3100/health",
       reuseExistingServer: false,
       timeout: 30_000,

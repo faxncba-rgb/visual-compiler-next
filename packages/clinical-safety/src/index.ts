@@ -127,7 +127,9 @@ export type StudioApplicationProfile = z.infer<
 
 export function createStudioApplicationProfiles(
   fixtureOrigin = localFixtureProfile.trainingOrigins[0],
+  trainingOrigin = ncbaDpiProfile.trainingOrigins[0],
 ): StudioApplicationProfile[] {
+  const normalizedTrainingOrigin = new URL(trainingOrigin).origin;
   return [
     {
       id: "ncba-dpi-fixture",
@@ -147,7 +149,7 @@ export function createStudioApplicationProfiles(
       applicationProfileId: "ncba-dpi",
       name: "NCBA DPI — authorized synthetic training",
       mode: "training",
-      defaultUrl: "https://dpi-ncba.gbna-sante.fr/",
+      defaultUrl: `${normalizedTrainingOrigin}/`,
       urlEditable: true,
       managedBrowserOnly: true,
       compilationAllowed: true,
@@ -161,7 +163,7 @@ export function createStudioApplicationProfiles(
       applicationProfileId: "ncba-dpi",
       name: "NCBA DPI — clinical runtime",
       mode: "clinical",
-      defaultUrl: "https://dpi-ncba.gbna-sante.fr/",
+      defaultUrl: `${normalizedTrainingOrigin}/`,
       urlEditable: true,
       managedBrowserOnly: true,
       compilationAllowed: false,
@@ -177,10 +179,13 @@ export function resolveStudioProfileTarget(input: {
   targetUrl: string;
   purpose: "open" | "capture" | "compile" | "run";
   fixtureOrigin?: string;
+  trainingOrigin?: string;
+  allowExplicitLocalFixture?: boolean;
 }) {
-  const profile = createStudioApplicationProfiles(input.fixtureOrigin).find(
-    (candidate) => candidate.id === input.profileId,
-  );
+  const profile = createStudioApplicationProfiles(
+    input.fixtureOrigin,
+    input.trainingOrigin,
+  ).find((candidate) => candidate.id === input.profileId);
   if (!profile) throw new Error("Unknown Studio application profile.");
   if (input.purpose === "compile" && !profile.compilationAllowed) {
     throw new Error("Compilation is technically disabled in clinical mode.");
@@ -199,11 +204,17 @@ export function resolveStudioProfileTarget(input: {
           trainingOrigins: [fixtureOrigin],
           runtimeOrigins: [fixtureOrigin],
         })
-      : ncbaDpiProfile;
+      : ApplicationProfileSchema.parse({
+          ...ncbaDpiProfile,
+          trainingOrigins: [new URL(profile.defaultUrl).origin],
+          runtimeOrigins: [new URL(profile.defaultUrl).origin],
+        });
   const url = validateTargetUrl(input.targetUrl, {
     mode: profile.mode,
     profile: applicationProfile,
-    allowExplicitLocalFixture: profile.id === "ncba-dpi-fixture",
+    allowExplicitLocalFixture:
+      profile.id === "ncba-dpi-fixture" ||
+      input.allowExplicitLocalFixture === true,
   });
   return { profile, applicationProfile, url };
 }
@@ -269,21 +280,22 @@ export function validateTargetUrl(raw: string, options: SafeUrlOptions) {
   }
   if (url.username || url.password)
     throw new Error("Credentials in URLs are forbidden.");
-  const localFixture =
-    options.allowExplicitLocalFixture === true &&
-    options.profile.id === "ncba-dpi-fixture";
-  if (url.protocol !== "https:" && !localFixture)
-    throw new Error("HTTPS is required.");
-  if (isPrivateHost(url.hostname) && !localFixture)
-    throw new Error("Private and loopback targets are denied by default.");
   const allowedOrigins =
     options.mode === "training"
       ? options.profile.trainingOrigins
       : options.profile.runtimeOrigins;
-  const targetOrigin = new URL(url).origin;
   const configuredOrigins = new Set(
     allowedOrigins.map((allowedOrigin) => new URL(allowedOrigin).origin),
   );
+  const localFixture =
+    options.allowExplicitLocalFixture === true &&
+    isPrivateHost(url.hostname) &&
+    configuredOrigins.has(url.origin);
+  if (url.protocol !== "https:" && !localFixture)
+    throw new Error("HTTPS is required.");
+  if (isPrivateHost(url.hostname) && !localFixture)
+    throw new Error("Private and loopback targets are denied by default.");
+  const targetOrigin = new URL(url).origin;
   if (!configuredOrigins.has(targetOrigin))
     throw new Error("Target origin is not allowed by the Application Profile.");
   if (

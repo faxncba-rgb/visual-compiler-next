@@ -21,4 +21,18 @@ flowchart LR
 
 Training and clinical may share an origin, so mode is never inferred from origin. Separate browser profile IDs, independent manually authenticated sessions, explicit attestation, artifact state, and backend authorization distinguish them.
 
+Managed Training navigation is a two-state machine:
+
+```text
+Open in managed browser
+→ AUTHENTICATION BOOTSTRAP
+  HTTPS SSO redirects/popups allowed; capture/compile denied
+→ primary page returns to configured application origin
+→ explicit human lock
+→ APPLICATION LOCKED
+  main-page origin enforced; capture/compile may proceed
+```
+
+The managed browser context is ephemeral and memory-only. Route policy distinguishes primary-page navigation from iframe navigation, popup navigation, and subresources. OpenAI HTTP/WebSocket traffic is blocked in both states. Cross-origin frames may render after lock but never enter the page model.
+
 Artifacts remain exclusive and versioned. Existing files cannot be silently overwritten. SHA-256 is verified before a promoted workflow may run. Ed25519 with a private key outside the repository is the next integrity milestone.

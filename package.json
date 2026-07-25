@@ -10,6 +10,7 @@
   "scripts": {
     "dev": "concurrently -n demo,studio -c green,cyan \"npm run dev:demo\" \"npm run dev:studio\"",
     "dev:demo": "node --env-file-if-exists=.env --import tsx apps/demo-site/src/server.ts",
+    "dev:sso-fixture": "node --env-file-if-exists=.env --import tsx apps/demo-site/src/ssoFixtureServer.ts",
     "dev:studio": "node --env-file-if-exists=.env --import tsx apps/studio/backend/src/server.ts",
     "start:demo": "node --import tsx apps/demo-site/src/server.ts",
     "start:studio": "node --import tsx apps/studio/backend/src/server.ts",

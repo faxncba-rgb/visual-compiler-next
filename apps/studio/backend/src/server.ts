@@ -3,7 +3,6 @@ import { randomUUID } from "node:crypto";
 import { constants, existsSync } from "node:fs";
 import {
   access,
-  chmod,
   copyFile,
   mkdir,
   readdir,
@@ -12,7 +11,12 @@ import {
 } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
-import { chromium, type BrowserContext } from "playwright";
+import {
+  chromium,
+  type Browser,
+  type BrowserContext,
+  type Page,
+} from "playwright";
 import {
   compileWorkflow,
   createRedactedCompilerPageModel,
@@ -93,8 +97,51 @@ const publicDemoUrl = normalizedBaseUrl(
   DEFAULT_DEMO_PUBLIC_URL,
   "DEMO_SITE_PUBLIC_URL",
 );
-const studioProfiles = createStudioApplicationProfiles(publicDemoUrl);
-const managedContexts = new Map<StudioProfileId, BrowserContext>();
+const managedTrainingOrigin = normalizedBaseUrl(
+  process.env.NCBA_TRAINING_ORIGIN ??
+    "https://dpi-ncba.gbna-sante.fr",
+  "NCBA_TRAINING_ORIGIN",
+);
+const allowExplicitLocalSsoFixture =
+  process.env.ALLOW_EXPLICIT_LOCAL_SSO_FIXTURE === "true" &&
+  ["127.0.0.1", "localhost"].includes(
+    new URL(managedTrainingOrigin).hostname,
+  );
+const syntheticSsoAuthOrigin = allowExplicitLocalSsoFixture
+  ? normalizedBaseUrl(
+      process.env.SSO_FIXTURE_AUTH_ORIGIN ?? "http://127.0.0.1:4275",
+      "SSO_FIXTURE_AUTH_ORIGIN",
+    )
+  : null;
+const studioProfiles = createStudioApplicationProfiles(
+  publicDemoUrl,
+  managedTrainingOrigin,
+);
+function resolveStudioTarget(
+  input: Omit<
+    Parameters<typeof resolveStudioProfileTarget>[0],
+    "fixtureOrigin" | "trainingOrigin" | "allowExplicitLocalFixture"
+  >,
+) {
+  return resolveStudioProfileTarget({
+    ...input,
+    fixtureOrigin: publicDemoUrl,
+    trainingOrigin: managedTrainingOrigin,
+    allowExplicitLocalFixture: allowExplicitLocalSsoFixture,
+  });
+}
+type ManagedBrowserPhase =
+  | "authentication-bootstrap"
+  | "application-locked";
+type ManagedBrowserSession = {
+  id: string;
+  browser: Browser;
+  context: BrowserContext;
+  primaryPage: Page;
+  phase: ManagedBrowserPhase;
+  applicationOrigin: string;
+};
+const managedSessions = new Map<StudioProfileId, ManagedBrowserSession>();
 const captures = new Map<
   string,
   {
@@ -104,6 +151,7 @@ const captures = new Map<
     redactedModel: RedactedPageModel;
     fingerprint: StructuralFingerprint;
     attestedAt: string;
+    managedSessionId?: string;
   }
 >();
 type LifecycleRecord = {
@@ -212,49 +260,78 @@ async function ensureWorkflowStorage() {
   await access(WORKFLOW_STORAGE_DIR, constants.R_OK | constants.W_OK);
 }
 
-async function ensureBrowserProfileDirectory(profileId: StudioProfileId) {
-  await mkdir(browserProfileRoot, { recursive: true, mode: 0o700 });
-  await chmod(browserProfileRoot, 0o700);
-  const profileDirectory = path.join(browserProfileRoot, profileId);
-  await mkdir(profileDirectory, { recursive: true, mode: 0o700 });
-  await chmod(profileDirectory, 0o700);
-  return profileDirectory;
-}
-
 function isOpenAIHost(hostname: string) {
   const normalized = hostname.toLowerCase().replace(/\.$/, "");
   return normalized === "openai.com" || normalized.endsWith(".openai.com");
 }
 
+function isPermittedManagedRequestUrl(url: URL) {
+  if (url.protocol === "https:") return true;
+  return (
+    allowExplicitLocalSsoFixture &&
+    url.protocol === "http:" &&
+    ["127.0.0.1", "localhost"].includes(url.hostname)
+  );
+}
+
 async function openManagedBrowser(profileId: StudioProfileId, target: URL) {
-  const allowedNavigationOrigin = new URL(target).origin;
-  const existing = managedContexts.get(profileId);
+  const existing = managedSessions.get(profileId);
   if (existing) {
-    const page = existing.pages()[0] ?? (await existing.newPage());
-    await page.goto(target.toString());
-    if (new URL(page.url()).origin !== allowedNavigationOrigin) {
-      throw new Error("Cross-origin navigation was blocked.");
-    }
-    await page.bringToFront();
-    return;
+    await existing.context.close();
+    await existing.browser.close();
+    managedSessions.delete(profileId);
   }
-  const profileDirectory = await ensureBrowserProfileDirectory(profileId);
-  const context = await chromium.launchPersistentContext(profileDirectory, {
+  const browser = await chromium.launch({
     headless: false,
+  });
+  const context = await browser.newContext({
     serviceWorkers: "block",
     viewport: null,
   });
-  managedContexts.set(profileId, context);
-  context.on("close", () => managedContexts.delete(profileId));
+  const primaryPage = await context.newPage();
+  const session: ManagedBrowserSession = {
+    id: randomUUID(),
+    browser,
+    context,
+    primaryPage,
+    phase: "authentication-bootstrap",
+    applicationOrigin: target.origin,
+  };
+  managedSessions.set(profileId, session);
+  context.on("close", () => managedSessions.delete(profileId));
+  context.on("page", (page) => {
+    if (
+      session.phase === "application-locked" &&
+      page !== session.primaryPage
+    ) {
+      void page.close();
+    }
+  });
   await context.route("**/*", async (route) => {
     const requestUrl = new URL(route.request().url());
-    if (isOpenAIHost(requestUrl.hostname)) {
+    if (
+      isOpenAIHost(requestUrl.hostname) ||
+      !isPermittedManagedRequestUrl(requestUrl)
+    ) {
       await route.abort("blockedbyclient");
       return;
     }
+    let isPrimaryPageNavigation = false;
+    if (route.request().isNavigationRequest()) {
+      try {
+        isPrimaryPageNavigation =
+          route.request().frame() === session.primaryPage.mainFrame();
+      } catch {
+        // Popup navigation can be issued before Playwright creates its frame.
+        // It is allowed during bootstrap and is never mistaken for the
+        // primary application page.
+        isPrimaryPageNavigation = false;
+      }
+    }
     if (
-      route.request().isNavigationRequest() &&
-      requestUrl.origin !== allowedNavigationOrigin
+      session.phase === "application-locked" &&
+      isPrimaryPageNavigation &&
+      requestUrl.origin !== session.applicationOrigin
     ) {
       await route.abort("blockedbyclient");
       return;
@@ -269,11 +346,56 @@ async function openManagedBrowser(profileId: StudioProfileId, target: URL) {
         reason: "OpenAI network access is forbidden in managed browsers.",
       }),
   );
-  const page = context.pages()[0] ?? (await context.newPage());
-  await page.goto(target.toString());
-  if (new URL(page.url()).origin !== allowedNavigationOrigin) {
-    throw new Error("Cross-origin navigation was blocked.");
+  try {
+    await primaryPage.goto(target.toString());
+    await primaryPage.bringToFront();
+    return session;
+  } catch (error) {
+    await context.close().catch(() => undefined);
+    await browser.close().catch(() => undefined);
+    managedSessions.delete(profileId);
+    throw error;
   }
+}
+
+function managedSessionStatus(session: ManagedBrowserSession) {
+  let currentOrigin: string | null = null;
+  try {
+    const current = new URL(session.primaryPage.url());
+    if (["http:", "https:"].includes(current.protocol)) {
+      currentOrigin = current.origin;
+    }
+  } catch {
+    currentOrigin = null;
+  }
+  return {
+    phase: session.phase,
+    applicationOrigin: session.applicationOrigin,
+    currentOrigin,
+    canLock:
+      session.phase === "authentication-bootstrap" &&
+      currentOrigin === session.applicationOrigin,
+    popupCount: Math.max(0, session.context.pages().length - 1),
+    captureAllowed: session.phase === "application-locked",
+    compilationAllowed: session.phase === "application-locked",
+    llmCalls: 0,
+    openAIRequests: 0,
+  };
+}
+
+async function lockManagedBrowserToApplication(
+  session: ManagedBrowserSession,
+) {
+  const status = managedSessionStatus(session);
+  if (!status.canLock) {
+    throw new Error("Primary page has not returned to the application origin.");
+  }
+  session.phase = "application-locked";
+  for (const page of session.context.pages()) {
+    if (page !== session.primaryPage) await page.close();
+  }
+  await session.primaryPage.bringToFront();
+  return managedSessionStatus(session);
 }
 
 function workflowArtifactPath(workflowId: string) {
@@ -365,6 +487,8 @@ function studioHtml() {
     .mode-title { font-weight: 900; letter-spacing: .08em; }
     .profile-status { display: grid; grid-template-columns: 1fr auto; gap: 8px; margin: 10px 0; padding: 10px; border-radius: 7px; background: #141820; }
     .profile-status strong { color: #fff; }
+    .authentication-state { margin-top: 10px; padding: 10px; border: 1px solid #d4a832; border-radius: 7px; background: #191b20; font-weight: 900; }
+    .authentication-state.locked { border-color: #2f8f68; color: #9df1c4; }
     .field { display: grid; gap: 6px; margin-top: 10px; }
     .field select, .field input { width: 100%; }
     .hidden { display: none !important; }
@@ -424,6 +548,8 @@ function studioHtml() {
         <button type="button" id="openManagedBrowser" disabled>Open in managed browser</button>
         <p class="hint warn" id="targetValidation" aria-live="polite">Validating configured target locally…</p>
         <p class="hint" id="openPolicy">Selecting a profile never opens its URL. Opening requires this explicit action.</p>
+        <div class="authentication-state hidden" id="authenticationState" aria-live="polite">AUTHENTICATION NOT STARTED — capture and compilation disabled</div>
+        <button type="button" class="hidden" id="lockManagedBrowser" disabled>Authentication complete — lock to application</button>
         <div class="attestation" id="syntheticAttestation" aria-label="Synthetic data attestation">
           <strong>I confirm that:</strong>
           <label><input type="checkbox" data-attestation-key="authorizedTrainingEnvironment"> <span>I am authorized to automate this training environment.</span></label>
@@ -533,7 +659,9 @@ OpenAI requests: 0</pre>
       capture: null,
       lifecycle: null,
       preflight: null,
-      targetValid: false
+      targetValid: false,
+      authenticationPhase: "idle",
+      canLockAuthentication: false
     };
     const output = document.getElementById("output");
     const workflowSelect = document.getElementById("workflow");
@@ -545,6 +673,7 @@ OpenAI requests: 0</pre>
     const indicatorVerified = document.getElementById("indicatorVerified");
     const controls = Array.from(document.querySelectorAll("button, select, input, textarea"));
     let targetValidationTimer;
+    let authenticationPollTimer;
     const variantUrl = variant => publicDemoUrl + "/demo?variant=" + variant;
     const lifecycleOrder = ["Draft", "Validated", "Approved", "Promoted", "Revoked"];
     const attestationComplete = () =>
@@ -553,6 +682,9 @@ OpenAI requests: 0</pre>
       const fixture = state.profile.id === "ncba-dpi-fixture";
       const attested = attestationComplete();
       const lifecycleState = state.lifecycle?.state;
+      const managedApplicationReady =
+        !state.profile.managedBrowserOnly ||
+        state.authenticationPhase === "application-locked";
       document.getElementById("openManagedBrowser").disabled =
         !state.targetValid ||
         (state.profile.syntheticAttestationRequired && !attested);
@@ -560,13 +692,18 @@ OpenAI requests: 0</pre>
         state.profile.mode === "clinical" ||
         !state.profile.captureAllowed ||
         !attested ||
-        !state.targetValid;
+        !state.targetValid ||
+        !managedApplicationReady;
       compileButton.disabled =
         state.profile.mode === "clinical" ||
         !state.profile.compilationAllowed ||
         !attested ||
         !state.targetValid ||
+        !managedApplicationReady ||
         !state.capture;
+      document.getElementById("lockManagedBrowser").disabled =
+        !state.canLockAuthentication ||
+        state.authenticationPhase !== "authentication-bootstrap";
       document.getElementById("runA").disabled = !fixture;
       document.getElementById("runB").disabled = !fixture;
       document.getElementById("validateWorkflow").disabled = !fixture || lifecycleState !== "Draft";
@@ -643,6 +780,56 @@ OpenAI requests: 0</pre>
         syncJourneyControls();
       }
     };
+    const renderAuthenticationState = authentication => {
+      state.authenticationPhase = authentication.phase ?? "idle";
+      state.canLockAuthentication = authentication.canLock === true;
+      const panel = document.getElementById("authenticationState");
+      panel.classList.toggle("hidden", !state.profile.managedBrowserOnly);
+      panel.classList.toggle(
+        "locked",
+        state.authenticationPhase === "application-locked"
+      );
+      if (state.authenticationPhase === "authentication-bootstrap") {
+        panel.textContent =
+          "AUTHENTICATION IN PROGRESS — capture and compilation disabled" +
+          (authentication.currentOrigin
+            ? " — current origin: " + authentication.currentOrigin
+            : "") +
+          (state.canLockAuthentication
+            ? " — application origin detected; locking is available."
+            : "");
+      } else if (state.authenticationPhase === "application-locked") {
+        panel.textContent =
+          "APPLICATION LOCKED — capture and compilation enabled — main-page origin enforced.";
+      } else {
+        panel.textContent =
+          "AUTHENTICATION NOT STARTED — capture and compilation disabled";
+      }
+      document.getElementById("lockManagedBrowser").classList.toggle(
+        "hidden",
+        !state.profile.managedBrowserOnly ||
+          state.authenticationPhase === "application-locked"
+      );
+      syncJourneyControls();
+    };
+    const pollAuthenticationStatus = async () => {
+      window.clearTimeout(authenticationPollTimer);
+      if (!state.profile.managedBrowserOnly) return;
+      try {
+        const response = await fetch(
+          "/api/managed-browser/status/" +
+            encodeURIComponent(state.profile.id)
+        );
+        if (response.ok) renderAuthenticationState(await response.json());
+      } finally {
+        if (state.authenticationPhase === "authentication-bootstrap") {
+          authenticationPollTimer = window.setTimeout(
+            pollAuthenticationStatus,
+            750
+          );
+        }
+      }
+    };
     const renderLifecycle = () => {
       const current = state.lifecycle?.state;
       const currentIndex = lifecycleOrder.indexOf(current);
@@ -673,6 +860,8 @@ OpenAI requests: 0</pre>
       targetUrl.value = profile.defaultUrl;
       targetUrl.readOnly = !profile.urlEditable;
       state.targetValid = false;
+      window.clearTimeout(authenticationPollTimer);
+      renderAuthenticationState({ phase: "idle", canLock: false });
       document.getElementById("syntheticAttestation").classList.toggle("hidden", !profile.syntheticAttestationRequired);
       document.getElementById("trainingControls").classList.toggle("hidden", profile.mode === "clinical");
       document.getElementById("fixtureLifecyclePanel").classList.toggle("hidden", profile.id !== "ncba-dpi-fixture");
@@ -691,6 +880,7 @@ OpenAI requests: 0</pre>
       setStatus(profile.mode === "clinical" ? "Clinical execution-only profile" : "Training profile selected");
       renderLifecycle();
       validateTargetInput();
+      if (profile.managedBrowserOnly) pollAuthenticationStatus();
     };
     const showWorkflowMetrics = workflow => {
       document.getElementById("compileCalls").textContent = workflow.diagnostics.modelCalls;
@@ -960,10 +1150,16 @@ OpenAI requests: 0</pre>
     document.getElementById("openManagedBrowser").addEventListener("click", async () => {
       if (
         state.profile.managedBrowserOnly &&
-        !window.confirm("This explicit action will contact only the configured profile origin in a visible managed browser. Continue?")
+        !window.confirm("This explicit action starts a visible, manual authentication bootstrap. Capture and compilation remain disabled until the browser returns to the configured application origin and you lock it. Continue?")
       ) return;
       setBusy(true);
       setStatus("Opening managed browser");
+      resetCapture();
+      renderAuthenticationState({
+        phase: "authentication-bootstrap",
+        canLock: false
+      });
+      pollAuthenticationStatus();
       try {
         const result = await requestJson("/api/managed-browser/open", {
           studioProfileId: state.profile.id,
@@ -971,10 +1167,33 @@ OpenAI requests: 0</pre>
           explicitUserAction: true,
           syntheticAttestation: syntheticAttestation()
         });
-        setStatus(result.status, "ok");
+        renderAuthenticationState(result);
+        pollAuthenticationStatus();
+        setStatus(result.status, "warn");
       } catch (error) {
+        renderAuthenticationState({ phase: "idle", canLock: false });
         setStatus("Managed browser opening failed", "error");
         output.textContent = JSON.stringify(error.response ?? { error: error.message }, null, 2);
+      } finally {
+        setBusy(false);
+      }
+    });
+    document.getElementById("lockManagedBrowser").addEventListener("click", async () => {
+      setBusy(true);
+      setStatus("Locking managed browser to application origin");
+      try {
+        const result = await requestJson("/api/managed-browser/lock", {
+          studioProfileId: state.profile.id,
+          explicitUserAction: true
+        });
+        window.clearTimeout(authenticationPollTimer);
+        renderAuthenticationState(result);
+        setStatus(result.status, "ok");
+      } catch (error) {
+        const status = error.response ?? {};
+        if (status.phase) renderAuthenticationState(status);
+        setStatus("Application lock refused", "error");
+        output.textContent = JSON.stringify(status.error ? status : { error: error.message }, null, 2);
       } finally {
         setBusy(false);
       }
@@ -1086,11 +1305,10 @@ app.post("/api/target/validate", (req, res) => {
     return;
   }
   try {
-    const resolved = resolveStudioProfileTarget({
+    const resolved = resolveStudioTarget({
       profileId: parsedProfileId.data,
       targetUrl: String(req.body.targetUrl ?? ""),
       purpose: "open",
-      fixtureOrigin: publicDemoUrl,
     });
     res.json({
       accepted: true,
@@ -1120,11 +1338,10 @@ app.post("/api/managed-browser/open", async (req, res) => {
     return;
   }
   try {
-    const resolved = resolveStudioProfileTarget({
+    const resolved = resolveStudioTarget({
       profileId: parsedProfileId.data,
       targetUrl: String(req.body.targetUrl ?? ""),
       purpose: "open",
-      fixtureOrigin: publicDemoUrl,
     });
     if (resolved.profile.syntheticAttestationRequired) {
       try {
@@ -1140,11 +1357,16 @@ app.post("/api/managed-browser/open", async (req, res) => {
         return;
       }
     }
-    await openManagedBrowser(parsedProfileId.data, resolved.url);
+    const session = await openManagedBrowser(
+      parsedProfileId.data,
+      resolved.url,
+    );
     res.json({
-      status: "Managed browser opened by explicit user action",
+      status:
+        "AUTHENTICATION IN PROGRESS — capture and compilation disabled",
       profileId: resolved.profile.id,
       mode: resolved.profile.mode,
+      ...managedSessionStatus(session),
     });
   } catch {
     res.status(400).json({
@@ -1153,14 +1375,144 @@ app.post("/api/managed-browser/open", async (req, res) => {
     });
   }
 });
+app.get("/api/managed-browser/status/:profileId", (req, res) => {
+  const parsedProfileId = StudioProfileIdSchema.safeParse(req.params.profileId);
+  if (!parsedProfileId.success) {
+    res.status(400).json({ error: "Unknown Studio application profile." });
+    return;
+  }
+  const session = managedSessions.get(parsedProfileId.data);
+  if (!session) {
+    res.json({
+      phase: "idle",
+      canLock: false,
+      captureAllowed: false,
+      compilationAllowed: false,
+      llmCalls: 0,
+      openAIRequests: 0,
+    });
+    return;
+  }
+  res.json(managedSessionStatus(session));
+});
+app.post("/api/managed-browser/lock", async (req, res) => {
+  if (req.body.explicitUserAction !== true) {
+    res.status(400).json({ error: "Explicit lock action is required." });
+    return;
+  }
+  const parsedProfileId = StudioProfileIdSchema.safeParse(
+    req.body.studioProfileId,
+  );
+  if (!parsedProfileId.success) {
+    res.status(400).json({ error: "Unknown Studio application profile." });
+    return;
+  }
+  const session = managedSessions.get(parsedProfileId.data);
+  if (!session) {
+    res.status(409).json({ error: "No managed authentication session." });
+    return;
+  }
+  try {
+    res.json({
+      status: "APPLICATION LOCKED — capture and compilation enabled",
+      ...(await lockManagedBrowserToApplication(session)),
+    });
+  } catch {
+    res.status(409).json({
+      error:
+        "Lock refused: primary page is not on the configured application origin.",
+      ...managedSessionStatus(session),
+    });
+  }
+});
+if (allowExplicitLocalSsoFixture) {
+  app.post("/api/test-only/sso/continue", async (req, res) => {
+    const session = managedSessions.get("ncba-dpi-training");
+    if (!session || session.phase !== "authentication-bootstrap") {
+      res.status(409).json({ error: "Synthetic SSO bootstrap is not active." });
+      return;
+    }
+    try {
+      const applicationReturn = session.primaryPage.waitForURL(
+        (url) => url.origin === session.applicationOrigin,
+        { timeout: 10_000 },
+      );
+      if (req.body.flow === "popup") {
+        const popupPromise = session.context.waitForEvent("page");
+        await session.primaryPage
+          .getByRole("button", {
+            name: "Open synthetic authentication popup",
+          })
+          .click();
+        const popup = await popupPromise;
+        await popup
+          .getByRole("button", {
+            name: "Complete synthetic popup authentication",
+          })
+          .click();
+      } else {
+        await session.primaryPage
+          .getByRole("button", {
+            name: "Continue synthetic authentication",
+          })
+          .click();
+      }
+      await applicationReturn;
+      res.json({
+        status: "Synthetic authentication returned to application",
+        flow: req.body.flow === "popup" ? "popup" : "redirect",
+        ...managedSessionStatus(session),
+      });
+    } catch {
+      res.status(500).json({ error: "Synthetic SSO continuation failed." });
+    }
+  });
+  app.post("/api/test-only/sso/attempt-exit", async (_req, res) => {
+    const session = managedSessions.get("ncba-dpi-training");
+    if (!session || session.phase !== "application-locked") {
+      res.status(409).json({ error: "Application is not locked." });
+      return;
+    }
+    let blocked = false;
+    try {
+      await session.primaryPage.goto(
+        `${syntheticSsoAuthOrigin}/outside?exit_token=SYNTHETIC-EXIT-TOKEN`,
+      );
+    } catch {
+      blocked = true;
+    }
+    res.json({
+      blocked,
+      ...managedSessionStatus(session),
+    });
+  });
+  app.post("/api/test-only/sso/probe-openai-block", async (_req, res) => {
+    const session = managedSessions.get("ncba-dpi-training");
+    if (!session) {
+      res.status(409).json({ error: "Managed session is not active." });
+      return;
+    }
+    const blocked = await session.primaryPage.evaluate(async () => {
+      try {
+        await fetch("https://api.openai.com/v1/models");
+        return false;
+      } catch {
+        return true;
+      }
+    });
+    res.json({ blocked, llmCalls: 0, openAIRequests: 0 });
+  });
+}
 app.delete("/api/browser-profiles/:profileId", async (req, res) => {
   const parsedProfileId = StudioProfileIdSchema.safeParse(req.params.profileId);
   if (!parsedProfileId.success) {
     res.status(400).json({ error: "Unknown Studio application profile." });
     return;
   }
-  await managedContexts.get(parsedProfileId.data)?.close();
-  managedContexts.delete(parsedProfileId.data);
+  const session = managedSessions.get(parsedProfileId.data);
+  await session?.context.close();
+  await session?.browser.close();
+  managedSessions.delete(parsedProfileId.data);
   const profileDirectory = path.join(browserProfileRoot, parsedProfileId.data);
   await rm(profileDirectory, { recursive: true, force: true });
   res.json({ status: `${parsedProfileId.data} browser profile deleted` });
@@ -1174,10 +1526,9 @@ app.post("/api/browser-profiles/:profileId/prepare", async (req, res) => {
   const profile = studioProfiles.find(
     (candidate) => candidate.id === parsedProfileId.data,
   )!;
-  await ensureBrowserProfileDirectory(parsedProfileId.data);
   res.json({
-    status: `${profile.id} browser profile prepared`,
-    permissions: "0700",
+    status: `${profile.id} ephemeral browser session ready`,
+    persistence: "memory-only",
     compilationAllowed: profile.compilationAllowed,
   });
 });
@@ -1205,11 +1556,10 @@ app.post("/api/capture", async (req, res) => {
   }
   let resolved: ReturnType<typeof resolveStudioProfileTarget>;
   try {
-    resolved = resolveStudioProfileTarget({
+    resolved = resolveStudioTarget({
       profileId: parsedProfileId.data,
       targetUrl: String(req.body.targetUrl ?? ""),
       purpose: "capture",
-      fixtureOrigin: publicDemoUrl,
     });
   } catch (error) {
     res
@@ -1232,22 +1582,42 @@ app.post("/api/capture", async (req, res) => {
   }
   try {
     let pageModel: PageModel;
+    let managedSessionId: string | undefined;
+    let crossOriginFramesExcluded = 0;
     if (studioProfile.managedBrowserOnly) {
-      const page = managedContexts.get(studioProfile.id)?.pages()[0];
-      if (!page) {
+      const session = managedSessions.get(studioProfile.id);
+      if (!session) {
         res.status(409).json({
           error:
             "Open this training profile manually in its managed browser before capture.",
         });
         return;
       }
-      resolveStudioProfileTarget({
+      if (session.phase !== "application-locked") {
+        res.status(423).json({
+          error:
+            "AUTHENTICATION IN PROGRESS — capture and compilation disabled.",
+        });
+        return;
+      }
+      const page = session.primaryPage;
+      resolveStudioTarget({
         profileId: studioProfile.id,
         targetUrl: page.url(),
         purpose: "capture",
-        fixtureOrigin: publicDemoUrl,
       });
+      crossOriginFramesExcluded = page
+        .frames()
+        .filter((frame) => {
+          if (frame === page.mainFrame()) return false;
+          try {
+            return new URL(frame.url()).origin !== session.applicationOrigin;
+          } catch {
+            return true;
+          }
+        }).length;
       pageModel = await extractPageModel(page);
+      managedSessionId = session.id;
     } else {
       const internalTarget = new URL(
         `${resolved.url.pathname}${resolved.url.search}`,
@@ -1265,6 +1635,7 @@ app.post("/api/capture", async (req, res) => {
       redactedModel,
       fingerprint,
       attestedAt: attestation.attestedAt,
+      managedSessionId,
     });
     const compilerBoundary = createRedactedCompilerPageModel(pageModel);
     res.json({
@@ -1273,6 +1644,7 @@ app.post("/api/capture", async (req, res) => {
       redactionReport: redactedModel.report,
       compilerBoundaryReport: compilerBoundary.redactionReport,
       structuralFingerprint: fingerprint,
+      crossOriginFramesExcluded,
       capturedValuesReturned: false,
       llmCalls: 0,
       openAIRequests: 0,
@@ -1302,11 +1674,10 @@ app.post("/api/compile", async (req, res) => {
   }
   let resolved: ReturnType<typeof resolveStudioProfileTarget>;
   try {
-    resolved = resolveStudioProfileTarget({
+    resolved = resolveStudioTarget({
       profileId: parsedProfileId.data,
       targetUrl: String(req.body.targetUrl ?? ""),
       purpose: "compile",
-      fixtureOrigin: publicDemoUrl,
     });
   } catch (error) {
     res
@@ -1327,6 +1698,19 @@ app.post("/api/compile", async (req, res) => {
     return;
   }
   try {
+    const managedSession = studioProfile.managedBrowserOnly
+      ? managedSessions.get(studioProfile.id)
+      : undefined;
+    if (
+      studioProfile.managedBrowserOnly &&
+      (!managedSession || managedSession.phase !== "application-locked")
+    ) {
+      res.status(423).json({
+        error:
+          "AUTHENTICATION IN PROGRESS — capture and compilation disabled.",
+      });
+      return;
+    }
     const instruction =
       typeof req.body.instruction === "string"
         ? req.body.instruction.trim()
@@ -1341,7 +1725,12 @@ app.post("/api/compile", async (req, res) => {
     const captureId =
       typeof req.body.captureId === "string" ? req.body.captureId : "";
     const capture = captures.get(captureId);
-    if (!capture || capture.studioProfileId !== studioProfile.id) {
+    if (
+      !capture ||
+      capture.studioProfileId !== studioProfile.id ||
+      (studioProfile.managedBrowserOnly &&
+        capture.managedSessionId !== managedSession?.id)
+    ) {
       res.status(409).json({
         error:
           "A fresh attested capture for the active profile is required before compilation.",
@@ -1654,6 +2043,20 @@ app.get("/api/workflow", async (req, res) => {
   }
 });
 
-app.listen(port, host, () =>
+const server = app.listen(port, host, () =>
   console.log(`Studio listening on http://${host}:${port}`),
 );
+
+for (const signal of ["SIGINT", "SIGTERM"] as const) {
+  process.once(signal, () => {
+    void Promise.all(
+      [...managedSessions.values()].map(async (session) => {
+        await session.context.close().catch(() => undefined);
+        await session.browser.close().catch(() => undefined);
+      }),
+    ).finally(() => {
+      managedSessions.clear();
+      server.close(() => process.exit(0));
+    });
+  });
+}

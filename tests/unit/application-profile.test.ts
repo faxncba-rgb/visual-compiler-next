@@ -114,6 +114,28 @@ describe("Application Profiles and safe URL mode", () => {
     ]);
   });
 
+  it("allows an explicitly configured loopback SSO fixture without weakening production defaults", () => {
+    const localTarget =
+      "http://127.0.0.1:4273/sso-app/start?patient_id=FAKE&mytime=123";
+    expect(
+      resolveStudioProfileTarget({
+        profileId: "ncba-dpi-training",
+        targetUrl: localTarget,
+        purpose: "open",
+        trainingOrigin: "http://127.0.0.1:4273",
+        allowExplicitLocalFixture: true,
+      }).url.toString(),
+    ).toBe(localTarget);
+    expect(() =>
+      resolveStudioProfileTarget({
+        profileId: "ncba-dpi-training",
+        targetUrl: localTarget,
+        purpose: "open",
+        trainingOrigin: "http://127.0.0.1:4273",
+      }),
+    ).toThrow(/HTTPS|loopback/);
+  });
+
   it("rejects insecure, sibling-subdomain, and cross-origin redirects", () => {
     expect(() =>
       validateTargetUrl(
