@@ -3,6 +3,7 @@ import { defineConfig, devices } from "@playwright/test";
 export default defineConfig({
   testDir: "tests/e2e",
   timeout: 45_000,
+  reporter: process.env.CI ? [["github"], ["line"]] : "list",
   // Studio owns one managed Chromium session and in-memory capture registry.
   // Serial E2E avoids cross-test contention with that intentionally singleton
   // local demonstration process.
