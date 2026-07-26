@@ -66,6 +66,9 @@ import {
 
 const port = Number(process.env.STUDIO_PORT ?? 3000);
 const host = process.env.STUDIO_HOST ?? "0.0.0.0";
+const labModeEnabled =
+  process.env.VISUAL_COMPILER_LAB_MODE === "true" &&
+  ["127.0.0.1", "localhost", "::1"].includes(host);
 const defaultWorkflowId = path.basename(WORKFLOW_PATH, ".json");
 const lifecycleStorageDirectory = path.join(WORKFLOW_STORAGE_DIR, ".state");
 const compilationRequests = new Map<
@@ -78,6 +81,12 @@ const compilationRequests = new Map<
   }
 >();
 const activeCompilationKeys = new Set<string>();
+const labSessions = new Map<
+  string,
+  { confirmedAt: string; expiresAt: number }
+>();
+const activeLabRuns = new Map<StudioProfileId, AbortController>();
+const LAB_SESSION_TTL_MS = 12 * 60 * 60_000;
 const COMPILE_RESPONSE_TIMEOUT_MS = 180_000;
 const compileProgressDelayMs = Math.max(
   0,
@@ -230,6 +239,23 @@ const trainingExecutionPreflights = new Map<
   TrainingExecutionPreflight
 >();
 const TRAINING_EXECUTION_PREFLIGHT_TTL_MS = 5 * 60_000;
+
+function isLabProfile(profileId: StudioProfileId) {
+  return (
+    profileId === "ncba-dpi-training" || profileId === "ncba-dpi-fixture"
+  );
+}
+
+function isLabAuthorized(token: unknown, profileId: StudioProfileId) {
+  if (!labModeEnabled || !isLabProfile(profileId) || typeof token !== "string")
+    return false;
+  const session = labSessions.get(token);
+  if (!session || session.expiresAt < Date.now()) {
+    if (session) labSessions.delete(token);
+    return false;
+  }
+  return true;
+}
 
 function normalizeInstructionForIdentity(instruction: string) {
   return instruction.normalize("NFC").trim().replace(/\s+/g, " ");
@@ -394,6 +420,60 @@ async function captureLocalFixture(url: string) {
     await context.close();
     await browser.close();
   }
+}
+
+async function extractManagedPageModel(
+  page: Page,
+  applicationOrigin: string,
+): Promise<PageModel> {
+  const sameOriginFrames = page.frames().filter((frame) => {
+    try {
+      return new URL(frame.url()).origin === applicationOrigin;
+    } catch {
+      return false;
+    }
+  });
+  const models = await Promise.all(
+    sameOriginFrames.map(async (frame, index) => {
+      const model = await extractPageModel(frame);
+      const prefix = `f${index}-`;
+      let title: string | undefined;
+      if (frame !== page.mainFrame()) {
+        title =
+          (await frame
+            .frameElement()
+            .then((element) => element.getAttribute("title"))
+            .catch(() => null)) ?? undefined;
+      }
+      const frameIdentity =
+        frame === page.mainFrame()
+          ? undefined
+          : {
+              name: frame.name() || undefined,
+              title,
+              pathname: new URL(frame.url()).pathname,
+              index,
+            };
+      return model.nodes.map((node) => ({
+        ...node,
+        id: `${prefix}${node.id}`,
+        parentId: node.parentId ? `${prefix}${node.parentId}` : undefined,
+        previousSiblingId: node.previousSiblingId
+          ? `${prefix}${node.previousSiblingId}`
+          : undefined,
+        nextSiblingId: node.nextSiblingId
+          ? `${prefix}${node.nextSiblingId}`
+          : undefined,
+        frame: frameIdentity,
+      }));
+    }),
+  );
+  return {
+    url: page.url(),
+    viewport: page.viewportSize() ?? { width: 1280, height: 720 },
+    nodes: models.flat(),
+    capturedAt: new Date().toISOString(),
+  };
 }
 
 function fixtureApplicationProfile() {
@@ -695,6 +775,7 @@ function assertSelectedCandidatesDeclaredUnique(workflow: SemanticWorkflow) {
 
 async function prepareLockedTrainingExecution(
   workflowId: string,
+  allowedStates: WorkflowState[] = ["Draft"],
 ): Promise<{
   record: LifecycleRecord;
   capture: CaptureRecord;
@@ -707,7 +788,7 @@ async function prepareLockedTrainingExecution(
   const record = lifecycleRecords.get(workflowId);
   if (!record) throw new Error("Workflow lifecycle record not found.");
   if (
-    record.state !== "Draft" ||
+    !allowedStates.includes(record.state) ||
     record.studioProfileId !== "ncba-dpi-training"
   ) {
     throw new Error("A restored ncba-dpi-training Draft is required.");
@@ -746,7 +827,10 @@ async function prepareLockedTrainingExecution(
     throw new Error("The managed page pathname does not match the Draft.");
   }
   assertSelectedCandidatesDeclaredUnique(record.workflow);
-  const currentPageModel = await extractPageModel(session.primaryPage);
+  const currentPageModel = await extractManagedPageModel(
+    session.primaryPage,
+    session.applicationOrigin,
+  );
   const currentFingerprint = createStructuralFingerprint(
     redactCapturedPageModel(currentPageModel),
   );
@@ -905,13 +989,28 @@ function validateArtifactAgainstCapture(input: {
     const primary = candidates.find(
       (candidate) => candidate.selector === step.selectedLocator?.primary,
     );
+    const orderedArtifactSelectors = [
+      step.selectedLocator?.primary,
+      ...step.candidates.map((candidate) => candidate.selector),
+      step.selectedLocator?.fallback,
+    ].filter((selector): selector is string => Boolean(selector));
+    const fallback = orderedArtifactSelectors
+      .filter((selector) => selector !== step.selectedLocator?.primary)
+      .map((selector) =>
+        candidates.find(
+          (candidate) => candidate.selector === selector && candidate.unique,
+        ),
+      )
+      .find((candidate) => candidate !== undefined);
     return {
       stepId: step.id,
       candidateCount: candidates.length,
       primaryUnique: primary?.unique === true,
+      deterministicFallback: fallback?.selector,
+      restorable: primary?.unique === true || Boolean(fallback),
     };
   });
-  if (locatorChecks.some((check) => !check.primaryUnique)) {
+  if (locatorChecks.some((check) => !check.restorable)) {
     throw new Error(
       "Artifact restoration refused: a selected locator is missing or ambiguous.",
     );
@@ -997,13 +1096,25 @@ async function findIdempotentDraft(input: {
   if (!persisted && existsSync(lifecyclePath(workflowId))) {
     persisted = await loadPersistedLifecycle(workflowId);
   }
-  validateArtifactAgainstCapture({
-    workflow: artifact.workflow,
-    capture: input.capture,
-    studioProfileId: input.studioProfileId,
-    canonicalUrl: input.canonicalUrl,
-    persisted,
-  });
+  try {
+    validateArtifactAgainstCapture({
+      workflow: artifact.workflow,
+      capture: input.capture,
+      studioProfileId: input.studioProfileId,
+      canonicalUrl: input.canonicalUrl,
+      persisted,
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (
+      message === "Artifact structural fingerprint is not compatible." ||
+      message ===
+        "Artifact restoration refused: a selected locator is missing or ambiguous."
+    ) {
+      return null;
+    }
+    throw error;
+  }
   return createDraftRecord({
     workflow: artifact.workflow,
     capture: input.capture,
@@ -1024,6 +1135,7 @@ function studioHtml() {
     "<",
     "\\u003c",
   );
+  const serializedLabModeEnabled = JSON.stringify(labModeEnabled);
   return `<!doctype html>
 <html lang="en">
 <head>
@@ -1063,6 +1175,12 @@ function studioHtml() {
     .warn { color: #f0bd59; }
     .error { color: #ff8585; }
     .mode-panel { border: 2px solid #d4a832; border-radius: 9px; padding: 14px; margin: 16px 0; background: #272315; }
+    .lab-panel { border: 3px solid #ff9f1c; background: #2c1b08; box-shadow: 0 0 0 2px #101216, 0 0 22px rgba(255,159,28,.22); }
+    .lab-banner { display: block; color: #ffd089; font-size: 17px; line-height: 1.25; margin-bottom: 10px; }
+    .lab-progress { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 5px; margin: 10px 0; }
+    .lab-progress span { padding: 6px 4px; border: 1px solid #61451f; border-radius: 5px; text-align: center; font-size: 11px; color: #b8a88f; }
+    .lab-progress span.active { color: white; background: #965b0c; border-color: #ffb340; }
+    .lab-progress span.complete { color: #8cf0b0; border-color: #3f8959; }
     .mode-panel.clinical { border-color: #d75252; background: #2b181b; }
     .mode-title { font-weight: 900; letter-spacing: .08em; }
     .profile-status { display: grid; grid-template-columns: 1fr auto; gap: 8px; margin: 10px 0; padding: 10px; border-radius: 7px; background: #141820; }
@@ -1118,6 +1236,35 @@ function studioHtml() {
     <aside class="left">
       <h1>Visual Compiler</h1>
       <p class="tagline">Compile on synthetic data. Execute on real workflows.</p>
+      <section class="mode-panel lab-panel hidden" id="labPanel" aria-label="Visual Compiler Lab Mode">
+        <strong class="lab-banner">LAB MODE — SYNTHETIC TEST ENVIRONMENT</strong>
+        <p class="hint">Fast local prototyping only. Clinical mode remains unavailable.</p>
+        <div id="labConfirmation">
+          <label><input type="checkbox" id="labSyntheticConfirmation"> I confirm that this session contains only synthetic test records.</label>
+          <button type="button" id="confirmLabSession" disabled>Confirm once for this session</button>
+        </div>
+        <strong id="labConfirmedState" class="ok hidden">CONFIRMATION UNIQUE — session active</strong>
+        <div class="lab-progress" id="labProgress" aria-label="Lab progress">
+          <span data-lab-stage="Browser">1. Browser</span>
+          <span data-lab-stage="Locked">2. Locked</span>
+          <span data-lab-stage="Captured">3. Captured</span>
+          <span data-lab-stage="Compiled">4. Compiled</span>
+          <span data-lab-stage="Ready">5. Ready</span>
+          <span data-lab-stage="Running">6. Running</span>
+          <span data-lab-stage="Passed">7. Passed</span>
+          <span data-lab-stage="Failed">7. Failed</span>
+        </div>
+        <div class="row">
+          <button type="button" id="labCapture" disabled>Capture now</button>
+          <button type="button" id="labCompile" aria-label="Lab Compile" disabled>Compile</button>
+          <button type="button" id="labRun" disabled>Run on current page</button>
+          <button type="button" id="labRunAgain" disabled>Run again</button>
+          <button type="button" id="labRecaptureCompile" disabled>Recapture and compile</button>
+          <button type="button" id="labStop" disabled>Stop</button>
+          <button type="button" id="labReset" disabled>Reset test session</button>
+        </div>
+        <pre id="labResult">Confirm the synthetic Lab session once to begin.</pre>
+      </section>
       <section class="mode-panel" id="activeProfilePanel" aria-label="Active application profile">
         <div class="mode-title">APPLICATION PROFILE</div>
         <label class="field" for="applicationProfile">Managed profile
@@ -1270,6 +1417,7 @@ OpenAI requests: 0</pre>
   <script>
     const publicDemoUrl = ${serializedPublicDemoUrl};
     const studioProfiles = ${serializedStudioProfiles};
+    const labModeEnabled = ${serializedLabModeEnabled};
     const state = {
       workflow: null,
       telemetry: null,
@@ -1282,7 +1430,12 @@ OpenAI requests: 0</pre>
       authenticationPhase: "idle",
       canLockAuthentication: false,
       compileInFlight: false,
-      trainingExecutionPreflight: null
+      trainingExecutionPreflight: null,
+      labSessionToken: null,
+      labRunCompleted: false,
+      labRunning: false,
+      labPreparing: false,
+      labStage: "Browser"
     };
     const output = document.getElementById("output");
     const workflowSelect = document.getElementById("workflow");
@@ -1301,8 +1454,13 @@ OpenAI requests: 0</pre>
     let authenticationPollTimer;
     const variantUrl = variant => publicDemoUrl + "/demo?variant=" + variant;
     const lifecycleOrder = ["Draft", "Validated", "Approved", "Promoted", "Revoked"];
+    const labActive = () =>
+      labModeEnabled &&
+      Boolean(state.labSessionToken) &&
+      state.profile.mode !== "clinical";
     const attestationComplete = () =>
-      attestationInputs.every(input => input.checked) && indicatorVerified.checked;
+      labActive() ||
+      (attestationInputs.every(input => input.checked) && indicatorVerified.checked);
     const syncJourneyControls = () => {
       const fixture = state.profile.id === "ncba-dpi-fixture";
       const attested = attestationComplete();
@@ -1378,12 +1536,50 @@ OpenAI requests: 0</pre>
         lifecycleState !== "Draft" ||
         !state.trainingExecutionPreflight ||
         !trainingExecutionConfirmation.checked;
+      const labReady =
+        labActive() &&
+        state.profile.mode !== "clinical" &&
+        managedApplicationReady;
+      const labExistingPageReady =
+        labReady &&
+        state.profile.id === "ncba-dpi-training" &&
+        state.authenticationPhase === "application-locked";
+      document.getElementById("labCapture").disabled = !labReady;
+      document.getElementById("labCompile").disabled =
+        !labReady || state.compileInFlight || state.labRunning || state.labPreparing;
+      document.getElementById("labRecaptureCompile").disabled =
+        !labReady || state.compileInFlight || state.labRunning || state.labPreparing;
+      document.getElementById("labRun").disabled =
+        !labExistingPageReady ||
+        state.labRunning ||
+        !state.workflow ||
+        !["Draft", "Validated"].includes(lifecycleState);
+      document.getElementById("labRunAgain").disabled =
+        !labExistingPageReady ||
+        state.labRunning ||
+        !state.labRunCompleted ||
+        !state.workflow;
+      document.getElementById("labStop").disabled = !state.labRunning;
+      document.getElementById("labReset").disabled = !labActive();
     };
     const setBusy = busy => {
       controls.forEach(control => { control.disabled = busy; });
       if (!busy) syncJourneyControls();
     };
     const setStatus = (text, cls = "warn") => { const el = document.getElementById("status"); el.textContent = text; el.className = cls; };
+    const setLabStage = stage => {
+      state.labStage = stage;
+      const order = ["Browser", "Locked", "Captured", "Compiled", "Ready", "Running", "Passed"];
+      const currentIndex = order.indexOf(stage);
+      document.querySelectorAll("[data-lab-stage]").forEach(node => {
+        const index = order.indexOf(node.dataset.labStage);
+        node.classList.toggle("active", node.dataset.labStage === stage);
+        node.classList.toggle(
+          "complete",
+          currentIndex >= 0 && index >= 0 && index < currentIndex
+        );
+      });
+    };
     const syntheticAttestation = () => ({
       profileId: state.profile.applicationProfileId,
       statements: Object.fromEntries(
@@ -1534,10 +1730,26 @@ OpenAI requests: 0</pre>
       window.clearTimeout(authenticationPollTimer);
       renderAuthenticationState({ phase: "idle", canLock: false });
       document.getElementById("syntheticAttestation").classList.toggle("hidden", !profile.syntheticAttestationRequired);
+      document.getElementById("labPanel").classList.toggle(
+        "hidden",
+        !labModeEnabled || profile.mode === "clinical"
+      );
+      document.getElementById("labConfirmation").classList.toggle(
+        "hidden",
+        labActive()
+      );
+      document.getElementById("labConfirmedState").classList.toggle(
+        "hidden",
+        !labActive()
+      );
+      document.getElementById("syntheticAttestation").classList.toggle(
+        "hidden",
+        !profile.syntheticAttestationRequired || labActive()
+      );
       document.getElementById("trainingControls").classList.toggle("hidden", profile.mode === "clinical");
       document.getElementById("trainingExecutionPanel").classList.toggle(
         "hidden",
-        profile.id !== "ncba-dpi-training"
+        profile.id !== "ncba-dpi-training" || labActive()
       );
       document.getElementById("fixtureLifecyclePanel").classList.toggle("hidden", profile.id !== "ncba-dpi-fixture");
       document.getElementById("clinicalPanel").classList.toggle("hidden", profile.mode !== "clinical");
@@ -1559,7 +1771,10 @@ OpenAI requests: 0</pre>
     };
     const showWorkflowMetrics = workflow => {
       document.getElementById("compileCalls").textContent = workflow.diagnostics.modelCalls;
-      document.getElementById("compileModel").textContent = workflow.diagnostics.responseModel ?? workflow.compileModel;
+      document.getElementById("compileModel").textContent =
+        workflow.diagnostics.interpretationSource === "mock"
+          ? "offline-mock (no model served)"
+          : workflow.diagnostics.responseModel ?? workflow.compileModel;
       const usage = workflow.diagnostics.tokenUsage;
       document.getElementById("compileTokens").textContent = usage ? usage.inputTokens + " / " + usage.outputTokens : "-";
       document.getElementById("confidence").textContent = Math.round(workflow.steps[0].selectedLocator.confidence * 100) + "%";
@@ -1712,33 +1927,42 @@ OpenAI requests: 0</pre>
         document.getElementById("demo").src = variantUrl(event.target.value);
       }
     });
+    const applyCaptureResult = json => {
+      state.capture = json;
+      compilerPayloadConfirmation.checked = labActive();
+      compilerPayloadConfirmation.disabled = labActive();
+      document.getElementById("compilerPayloadPreview").textContent =
+        JSON.stringify(json.compilerPayload, null, 2);
+      document.getElementById("redactionReport").textContent = JSON.stringify({
+        ...json.redactionReport,
+        compilerBoundary: json.compilerBoundaryReport,
+        cookiesCaptured: false,
+        storageCaptured: false,
+        networkCaptured: false,
+        capturedValuesReturned: json.capturedValuesReturned
+      }, null, 2);
+      document.getElementById("fingerprintReport").textContent = JSON.stringify({
+        version: json.structuralFingerprint.version,
+        sha256: json.structuralFingerprint.sha256,
+        requiredElements: json.structuralFingerprint.requiredElements
+      }, null, 2);
+      if (labActive()) setLabStage("Captured");
+    };
+    const captureCurrentPage = async () => {
+      const json = await requestJson("/api/capture", {
+          studioProfileId: state.profile.id,
+          targetUrl: targetUrl.value,
+          syntheticAttestation: syntheticAttestation(),
+          labSessionToken: state.labSessionToken
+        });
+      applyCaptureResult(json);
+      return json;
+    };
     document.getElementById("capture").addEventListener("click", async () => {
       setBusy(true);
       setStatus("Capturing redacted page model");
       try {
-        const json = await requestJson("/api/capture", {
-          studioProfileId: state.profile.id,
-          targetUrl: targetUrl.value,
-          syntheticAttestation: syntheticAttestation()
-        });
-        state.capture = json;
-        compilerPayloadConfirmation.checked = false;
-        compilerPayloadConfirmation.disabled = false;
-        document.getElementById("compilerPayloadPreview").textContent =
-          JSON.stringify(json.compilerPayload, null, 2);
-        document.getElementById("redactionReport").textContent = JSON.stringify({
-          ...json.redactionReport,
-          compilerBoundary: json.compilerBoundaryReport,
-          cookiesCaptured: false,
-          storageCaptured: false,
-          networkCaptured: false,
-          capturedValuesReturned: json.capturedValuesReturned
-        }, null, 2);
-        document.getElementById("fingerprintReport").textContent = JSON.stringify({
-          version: json.structuralFingerprint.version,
-          sha256: json.structuralFingerprint.sha256,
-          requiredElements: json.structuralFingerprint.requiredElements
-        }, null, 2);
+        await captureCurrentPage();
         setStatus("Redacted capture ready", "ok");
       } catch (error) {
         state.capture = null;
@@ -1748,7 +1972,7 @@ OpenAI requests: 0</pre>
         setBusy(false);
       }
     });
-    document.getElementById("compile").addEventListener("click", async () => {
+    const compileCurrentInstruction = async (forceNewCompilation = false) => {
       if (state.compileInFlight) return;
       state.compileInFlight = true;
       setBusy(true);
@@ -1767,7 +1991,9 @@ OpenAI requests: 0</pre>
           captureId: state.capture?.captureId,
           compilerPayloadConfirmed: compilerPayloadConfirmation.checked,
           compilerPayloadSha256: state.capture?.compilerPayloadSha256,
-          syntheticAttestation: syntheticAttestation()
+          syntheticAttestation: syntheticAttestation(),
+          labSessionToken: state.labSessionToken,
+          forceNewCompilation
         }, { timeoutMs: ${COMPILE_RESPONSE_TIMEOUT_MS} });
         await refreshWorkflowList(json.workflowId);
         await loadWorkflow(json.workflowId);
@@ -1783,6 +2009,24 @@ OpenAI requests: 0</pre>
             : "Compilation complete — Draft",
           "ok"
         );
+        if (labActive()) {
+          state.labRunCompleted = false;
+          setLabStage("Ready");
+          document.getElementById("labResult").textContent = JSON.stringify({
+            status: json.reused
+              ? "Compatible artifact reused — no model call"
+              : "Compilation complete",
+            requestedModel: state.workflow.compileModel,
+            servedModel:
+              state.workflow.diagnostics.interpretationSource === "mock"
+                ? "offline-mock (no model served)"
+                : state.workflow.diagnostics.responseModel ?? state.workflow.compileModel,
+            tokenUsage: state.workflow.diagnostics.tokenUsage ?? null,
+            durationMs: state.workflow.diagnostics.durationMs,
+            reused: json.reused,
+            modelCalls: state.workflow.diagnostics.modelCalls
+          }, null, 2);
+        }
       } catch (error) {
         setStatus("Failed", "error");
         output.textContent = JSON.stringify(error.response ?? { error: error.message }, null, 2);
@@ -1790,7 +2034,8 @@ OpenAI requests: 0</pre>
         state.compileInFlight = false;
         setBusy(false);
       }
-    });
+    };
+    document.getElementById("compile").addEventListener("click", () => compileCurrentInstruction(false));
     document.getElementById("restoreDraft").addEventListener("click", async () => {
       if (state.compileInFlight) return;
       state.compileInFlight = true;
@@ -2056,6 +2301,7 @@ OpenAI requests: 0</pre>
     document.getElementById("openManagedBrowser").addEventListener("click", async () => {
       if (
         state.profile.managedBrowserOnly &&
+        !labActive() &&
         !window.confirm("This explicit action starts a visible, manual authentication bootstrap. Capture and compilation remain disabled until the browser returns to the configured application origin and you lock it. Continue?")
       ) return;
       setBusy(true);
@@ -2071,9 +2317,11 @@ OpenAI requests: 0</pre>
           studioProfileId: state.profile.id,
           targetUrl: targetUrl.value,
           explicitUserAction: true,
-          syntheticAttestation: syntheticAttestation()
+          syntheticAttestation: syntheticAttestation(),
+          labSessionToken: state.labSessionToken
         });
         renderAuthenticationState(result);
+        if (labActive()) setLabStage("Browser");
         pollAuthenticationStatus();
         setStatus(result.status, "warn");
       } catch (error) {
@@ -2094,6 +2342,7 @@ OpenAI requests: 0</pre>
         });
         window.clearTimeout(authenticationPollTimer);
         renderAuthenticationState(result);
+        if (labActive()) setLabStage("Locked");
         setStatus(result.status, "ok");
       } catch (error) {
         const status = error.response ?? {};
@@ -2103,6 +2352,154 @@ OpenAI requests: 0</pre>
       } finally {
         setBusy(false);
       }
+    });
+    const labConfirmation = document.getElementById("labSyntheticConfirmation");
+    labConfirmation.addEventListener("change", () => {
+      document.getElementById("confirmLabSession").disabled =
+        !labModeEnabled || !labConfirmation.checked || state.profile.mode === "clinical";
+    });
+    document.getElementById("confirmLabSession").addEventListener("click", async () => {
+      try {
+        const result = await requestJson("/api/lab/confirm", {
+          studioProfileId: state.profile.id,
+          confirmed: labConfirmation.checked
+        });
+        state.labSessionToken = result.token;
+        document.getElementById("labConfirmation").classList.add("hidden");
+        document.getElementById("labConfirmedState").classList.remove("hidden");
+        document.getElementById("syntheticAttestation").classList.add("hidden");
+        document.getElementById("trainingExecutionPanel").classList.add("hidden");
+        document.getElementById("labResult").textContent =
+          "Synthetic Lab session confirmed once. Open the managed browser.";
+        setLabStage("Browser");
+        syncJourneyControls();
+      } catch (error) {
+        document.getElementById("labResult").textContent =
+          JSON.stringify(error.response ?? { error: error.message }, null, 2);
+      }
+    });
+    const ensureLabCapture = async force => {
+      let needsCapture = force || !state.capture;
+      let reason = needsCapture ? "Capture required." : "Checking page structure.";
+      if (!needsCapture && state.profile.id === "ncba-dpi-training") {
+        const status = await requestJson("/api/lab/capture-status", {
+          studioProfileId: state.profile.id,
+          labSessionToken: state.labSessionToken,
+          captureId: state.capture?.captureId
+        });
+        needsCapture = status.needsCapture;
+        reason = status.reason;
+      }
+      if (needsCapture) {
+        setStatus("Capturing current Lab page");
+        await captureCurrentPage();
+        reason = force
+          ? "Explicit recapture complete."
+          : "Automatic capture complete.";
+      }
+      document.getElementById("labResult").textContent = reason;
+      return state.capture;
+    };
+    document.getElementById("labCapture").addEventListener("click", async () => {
+      setBusy(true);
+      try {
+        await ensureLabCapture(true);
+        setStatus("Lab capture ready", "ok");
+      } catch (error) {
+        setLabStage("Failed");
+        setStatus("Lab capture failed", "error");
+        document.getElementById("labResult").textContent =
+          JSON.stringify(error.response ?? { error: error.message }, null, 2);
+      } finally {
+        setBusy(false);
+      }
+    });
+    const labCompile = async forceRecapture => {
+      if (state.compileInFlight || state.labPreparing) return;
+      state.labPreparing = true;
+      syncJourneyControls();
+      try {
+        await ensureLabCapture(forceRecapture);
+        state.labPreparing = false;
+        await compileCurrentInstruction(forceRecapture);
+      } catch (error) {
+        setLabStage("Failed");
+        setStatus("Lab compilation failed", "error");
+        document.getElementById("labResult").textContent =
+          JSON.stringify(error.response ?? { error: error.message }, null, 2);
+      } finally {
+        state.labPreparing = false;
+        syncJourneyControls();
+      }
+    };
+    document.getElementById("labCompile").addEventListener("click", () => labCompile(false));
+    document.getElementById("labRecaptureCompile").addEventListener("click", () => labCompile(true));
+    const runLabWorkflow = async () => {
+      if (state.labRunning) return;
+      state.labRunning = true;
+      setLabStage("Running");
+      setStatus("Running on current locked Lab page");
+      syncJourneyControls();
+      try {
+        const json = await requestJson("/api/lab/run", {
+          studioProfileId: state.profile.id,
+          labSessionToken: state.labSessionToken,
+          workflowId: state.workflow?.id
+        }, { timeoutMs: 120_000 });
+        state.telemetry = json.telemetry;
+        state.lifecycle = json.lifecycle;
+        state.labRunCompleted = true;
+        document.getElementById("runtimeCalls").textContent = "0";
+        document.getElementById("labResult").textContent = JSON.stringify({
+          status: json.status,
+          steps: json.telemetry.steps,
+          llmCalls: json.telemetry.llmCalls,
+          openAIRequests: json.telemetry.openAIRequests
+        }, null, 2);
+        setLabStage("Passed");
+        setStatus(json.status, "ok");
+        renderLifecycle();
+      } catch (error) {
+        state.labRunCompleted = false;
+        setLabStage("Failed");
+        setStatus("Lab run failed or stopped", "error");
+        document.getElementById("labResult").textContent =
+          JSON.stringify(error.response ?? { error: error.message }, null, 2);
+      } finally {
+        state.labRunning = false;
+        syncJourneyControls();
+      }
+    };
+    document.getElementById("labRun").addEventListener("click", runLabWorkflow);
+    document.getElementById("labRunAgain").addEventListener("click", runLabWorkflow);
+    document.getElementById("labStop").addEventListener("click", async () => {
+      try {
+        const result = await requestJson("/api/lab/stop", {
+          studioProfileId: state.profile.id,
+          labSessionToken: state.labSessionToken
+        });
+        state.labRunning = false;
+        setStatus("Lab run stopped; managed session preserved", "warn");
+        document.getElementById("labResult").textContent =
+          JSON.stringify(result, null, 2);
+      } finally {
+        syncJourneyControls();
+      }
+    });
+    document.getElementById("labReset").addEventListener("click", async () => {
+      await requestJson("/api/lab/reset", {
+        studioProfileId: state.profile.id,
+        labSessionToken: state.labSessionToken
+      });
+      state.labSessionToken = null;
+      state.labRunCompleted = false;
+      resetCapture();
+      labConfirmation.checked = false;
+      document.getElementById("labConfirmation").classList.remove("hidden");
+      document.getElementById("labConfirmedState").classList.add("hidden");
+      document.getElementById("labResult").textContent =
+        "Lab session reset. The managed authentication session remains open.";
+      renderProfile(state.profile);
     });
     [...attestationInputs, indicatorVerified, compilerPayloadConfirmation, restoreArtifactConfirmation, trainingExecutionConfirmation].forEach(input => {
       input.addEventListener("change", syncJourneyControls);
@@ -2201,6 +2598,112 @@ app.get("/health", async (_req, res) => {
     });
   }
 });
+app.get("/api/lab/config", (_req, res) => {
+  res.json({
+    enabled: labModeEnabled,
+    requiresLocalStudioHost: true,
+    allowedProfiles: ["ncba-dpi-fixture", "ncba-dpi-training"],
+    clinicalAllowed: false,
+  });
+});
+app.post("/api/lab/confirm", (req, res) => {
+  const parsedProfileId = StudioProfileIdSchema.safeParse(
+    req.body.studioProfileId,
+  );
+  if (
+    !labModeEnabled ||
+    !parsedProfileId.success ||
+    !isLabProfile(parsedProfileId.data) ||
+    req.body.confirmed !== true
+  ) {
+    res.status(403).json({
+      error:
+        "LAB MODE requires a local Studio, a non-clinical profile, and explicit synthetic-session confirmation.",
+    });
+    return;
+  }
+  const token = randomUUID();
+  const confirmedAt = new Date().toISOString();
+  labSessions.set(token, {
+    confirmedAt,
+    expiresAt: Date.now() + LAB_SESSION_TTL_MS,
+  });
+  res.json({
+    token,
+    confirmedAt,
+    status: "LAB MODE — SYNTHETIC TEST ENVIRONMENT",
+  });
+});
+app.post("/api/lab/reset", async (req, res) => {
+  const parsedProfileId = StudioProfileIdSchema.safeParse(
+    req.body.studioProfileId,
+  );
+  if (
+    !parsedProfileId.success ||
+    !isLabAuthorized(req.body.labSessionToken, parsedProfileId.data)
+  ) {
+    res.status(403).json({ error: "Active LAB MODE session required." });
+    return;
+  }
+  labSessions.delete(req.body.labSessionToken);
+  activeLabRuns.get(parsedProfileId.data)?.abort();
+  activeLabRuns.delete(parsedProfileId.data);
+  res.json({
+    status: "Lab test session reset; managed authentication remains open.",
+  });
+});
+app.post("/api/lab/capture-status", async (req, res) => {
+  const profileId = StudioProfileIdSchema.safeParse(req.body.studioProfileId);
+  if (
+    !profileId.success ||
+    profileId.data !== "ncba-dpi-training" ||
+    !isLabAuthorized(req.body.labSessionToken, profileId.data)
+  ) {
+    res.status(403).json({ error: "Active Training LAB MODE required." });
+    return;
+  }
+  const session = managedSessions.get(profileId.data);
+  if (!session || session.phase !== "application-locked") {
+    res.status(409).json({ error: "Application is not locked." });
+    return;
+  }
+  const capture =
+    typeof req.body.captureId === "string"
+      ? captures.get(req.body.captureId)
+      : undefined;
+  if (!capture || capture.managedSessionId !== session.id) {
+    res.json({ needsCapture: true, reason: "No current-session capture." });
+    return;
+  }
+  if (
+    canonicalizeTargetUrl(capture.pageModel.url) !==
+    canonicalizeTargetUrl(session.primaryPage.url())
+  ) {
+    res.json({
+      needsCapture: true,
+      reason: "Canonical pathname changed — automatic recapture required.",
+    });
+    return;
+  }
+  const currentModel = await extractManagedPageModel(
+    session.primaryPage,
+    session.applicationOrigin,
+  );
+  const currentFingerprint = createStructuralFingerprint(
+    redactCapturedPageModel(currentModel),
+  );
+  const compatibility = compareStructuralFingerprints(
+    capture.fingerprint,
+    currentFingerprint,
+  );
+  res.json({
+    needsCapture: currentFingerprint.sha256 !== capture.fingerprint.sha256,
+    reason: currentFingerprint.sha256 === capture.fingerprint.sha256
+      ? "Structure unchanged — capture reused."
+      : "Structure changed — automatic recapture required.",
+    structuralCompatibility: compatibility.score,
+  });
+});
 app.get("/api/application-profiles", (_req, res) => {
   res.json({ profiles: studioProfiles });
 });
@@ -2251,7 +2754,10 @@ app.post("/api/managed-browser/open", async (req, res) => {
       targetUrl: String(req.body.targetUrl ?? ""),
       purpose: "open",
     });
-    if (resolved.profile.syntheticAttestationRequired) {
+    if (
+      resolved.profile.syntheticAttestationRequired &&
+      !isLabAuthorized(req.body.labSessionToken, parsedProfileId.data)
+    ) {
       try {
         requireValidAttestation(
           req.body.syntheticAttestation,
@@ -2418,7 +2924,9 @@ if (allowExplicitLocalSsoFixture) {
     const pathname =
       req.body.destination === "wrong-path"
         ? "/ncba-fixture?mode=training&variant=A"
-        : "/cgi-professional";
+        : req.body.destination === "modified"
+          ? "/cgi-professional?legacy=1&frames=1&layout=modified"
+          : "/cgi-professional?legacy=1&frames=1";
     try {
       await session.primaryPage.goto(
         `${session.applicationOrigin}${pathname}`,
@@ -2443,6 +2951,9 @@ if (allowExplicitLocalSsoFixture) {
       expectedSyntheticValuePresent:
         (document.querySelector("#observation") as HTMLTextAreaElement | null)
           ?.value === "test du DR LEROY",
+      secondSyntheticValuePresent:
+        (document.querySelector("#observation") as HTMLTextAreaElement | null)
+          ?.value === "second test synthétique",
       savePostconditionVisible:
         document.querySelector("#observation-result")?.textContent ===
         "Enregistrement synthétique effectué",
@@ -2514,18 +3025,22 @@ app.post("/api/capture", async (req, res) => {
       .json({ error: error instanceof Error ? error.message : String(error) });
     return;
   }
-  let attestation;
-  try {
-    attestation = requireValidAttestation(
-      req.body.syntheticAttestation,
-      resolved.applicationProfile,
-    );
-  } catch {
-    res.status(403).json({
-      error:
-        "Capture closed: complete fresh synthetic-environment attestation is required.",
-    });
-    return;
+  let attestation: { attestedAt: string };
+  if (isLabAuthorized(req.body.labSessionToken, parsedProfileId.data)) {
+    attestation = { attestedAt: new Date().toISOString() };
+  } else {
+    try {
+      attestation = requireValidAttestation(
+        req.body.syntheticAttestation,
+        resolved.applicationProfile,
+      );
+    } catch {
+      res.status(403).json({
+        error:
+          "Capture closed: complete fresh synthetic-environment attestation is required.",
+      });
+      return;
+    }
   }
   try {
     let pageModel: PageModel;
@@ -2561,7 +3076,10 @@ app.post("/api/capture", async (req, res) => {
           return true;
         }
       }).length;
-      pageModel = await extractPageModel(page);
+      pageModel = await extractManagedPageModel(
+        page,
+        session.applicationOrigin,
+      );
       managedSessionId = session.id;
     } else {
       const internalTarget = new URL(
@@ -2653,17 +3171,23 @@ app.post("/api/compile", async (req, res) => {
       .json({ error: error instanceof Error ? error.message : String(error) });
     return;
   }
-  try {
-    requireValidAttestation(
-      req.body.syntheticAttestation,
-      resolved.applicationProfile,
-    );
-  } catch {
-    res.status(403).json({
-      error:
-        "Compilation closed: complete fresh synthetic-environment attestation is required.",
-    });
-    return;
+  const labAuthorized = isLabAuthorized(
+    req.body.labSessionToken,
+    parsedProfileId.data,
+  );
+  if (!labAuthorized) {
+    try {
+      requireValidAttestation(
+        req.body.syntheticAttestation,
+        resolved.applicationProfile,
+      );
+    } catch {
+      res.status(403).json({
+        error:
+          "Compilation closed: complete fresh synthetic-environment attestation is required.",
+      });
+      return;
+    }
   }
   try {
     const managedSession = studioProfile.managedBrowserOnly
@@ -2705,7 +3229,7 @@ app.post("/api/compile", async (req, res) => {
       return;
     }
     if (
-      req.body.compilerPayloadConfirmed !== true ||
+      (!labAuthorized && req.body.compilerPayloadConfirmed !== true) ||
       req.body.compilerPayloadSha256 !== capture.compilerPayloadSha256
     ) {
       res.status(428).json({
@@ -2737,13 +3261,16 @@ app.post("/api/compile", async (req, res) => {
     }
     activeCompilationKeys.add(idempotencyKey);
     try {
-      const reusable = await findIdempotentDraft({
-        idempotencyKey,
-        capture,
-        studioProfileId: studioProfile.id,
-        canonicalUrl,
-        instruction,
-      });
+      const reusable =
+        req.body.forceNewCompilation === true
+          ? null
+          : await findIdempotentDraft({
+              idempotencyKey,
+              capture,
+              studioProfileId: studioProfile.id,
+              canonicalUrl,
+              instruction,
+            });
       if (reusable) {
         updateCompilationProgress(requestId, "Compilation complete", {
           complete: true,
@@ -2804,7 +3331,14 @@ app.post("/api/workflows/restore-draft", async (req, res) => {
   const studioProfile = studioProfiles.find(
     (candidate) => candidate.id === parsedProfileId.data,
   )!;
-  if (studioProfile.mode === "clinical" || req.body.restoreConfirmed !== true) {
+  const labAuthorized = isLabAuthorized(
+    req.body.labSessionToken,
+    parsedProfileId.data,
+  );
+  if (
+    studioProfile.mode === "clinical" ||
+    (!labAuthorized && req.body.restoreConfirmed !== true)
+  ) {
     res.status(403).json({
       error:
         "Draft restoration requires Training mode and explicit human confirmation.",
@@ -2818,10 +3352,12 @@ app.post("/api/workflows/restore-draft", async (req, res) => {
       targetUrl: String(req.body.targetUrl ?? ""),
       purpose: "compile",
     });
-    requireValidAttestation(
-      req.body.syntheticAttestation,
-      resolved.applicationProfile,
-    );
+    if (!labAuthorized) {
+      requireValidAttestation(
+        req.body.syntheticAttestation,
+        resolved.applicationProfile,
+      );
+    }
   } catch (error) {
     res.status(403).json({
       error: error instanceof Error ? error.message : String(error),
@@ -3054,6 +3590,105 @@ app.post("/api/training/run-locked", async (req, res) => {
       openAIRequests: 0,
     });
   }
+});
+app.post("/api/lab/run", async (req, res) => {
+  const profileId = StudioProfileIdSchema.safeParse(req.body.studioProfileId);
+  if (
+    !profileId.success ||
+    profileId.data !== "ncba-dpi-training" ||
+    !isLabAuthorized(req.body.labSessionToken, profileId.data)
+  ) {
+    res.status(403).json({
+      error: "Active non-clinical LAB MODE Training session required.",
+    });
+    return;
+  }
+  if (activeLabRuns.has(profileId.data)) {
+    res.status(409).json({ error: "A Lab run is already in progress." });
+    return;
+  }
+  const controller = new AbortController();
+  activeLabRuns.set(profileId.data, controller);
+  try {
+    const prepared = await prepareLockedTrainingExecution(
+      String(req.body.workflowId ?? ""),
+      ["Draft", "Validated"],
+    );
+    const plannedActions = prepared.plannedActions;
+    const telemetry = await runWorkflowOnExistingPage({
+      page: prepared.session.primaryPage,
+      workflow: prepared.record.workflow,
+      expectedOrigin: prepared.session.applicationOrigin,
+      signal: controller.signal,
+    });
+    const passed =
+      telemetry.steps.length === prepared.record.workflow.steps.length &&
+      telemetry.steps.every((step) => step.status === "passed");
+    if (!passed) {
+      res.status(422).json({
+        error: controller.signal.aborted
+          ? "Lab run stopped by operator."
+          : "Lab run stopped at the first failed step.",
+        plannedActions,
+        telemetry,
+        lifecycle: lifecycleSummary(prepared.record),
+      });
+      return;
+    }
+    if (prepared.record.state === "Draft") {
+      prepared.record.validation = {
+        passed: true,
+        variants: [],
+        trainingTest: {
+          passed: true,
+          validatedAt: telemetry.finishedAt,
+          stepIds: telemetry.steps.map((step) => step.stepId),
+          llmCalls: 0,
+          openAIRequests: 0,
+        },
+      };
+      prepared.record.state = "Validated";
+      await persistLifecycle(prepared.record);
+    }
+    res.json({
+      status: "Lab run passed — ready to run again",
+      plannedActions,
+      telemetry,
+      lifecycle: lifecycleSummary(prepared.record),
+      llmCalls: 0,
+      openAIRequests: 0,
+    });
+  } catch (error) {
+    res.status(409).json({
+      error: error instanceof Error ? error.message : String(error),
+      llmCalls: 0,
+      openAIRequests: 0,
+    });
+  } finally {
+    activeLabRuns.delete(profileId.data);
+  }
+});
+app.post("/api/lab/stop", async (req, res) => {
+  const profileId = StudioProfileIdSchema.safeParse(req.body.studioProfileId);
+  if (
+    !profileId.success ||
+    !isLabAuthorized(req.body.labSessionToken, profileId.data)
+  ) {
+    res.status(403).json({ error: "Active LAB MODE session required." });
+    return;
+  }
+  const controller = activeLabRuns.get(profileId.data);
+  controller?.abort();
+  const session = managedSessions.get(profileId.data);
+  await session?.primaryPage
+    .evaluate(() => window.stop())
+    .catch(() => undefined);
+  res.json({
+    stopped: Boolean(controller),
+    sessionPreserved: true,
+    llmCalls: 0,
+    openAIRequests: 0,
+  });
 });
 app.post("/api/workflows/:workflowId/validate", async (req, res) => {
   const record = lifecycleRecords.get(req.params.workflowId);

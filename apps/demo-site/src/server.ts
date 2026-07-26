@@ -1,6 +1,9 @@
 import express from "express";
 import { renderDemoPage, type DemoVariant } from "./renderDemoPage.js";
-import { renderCgiFixture } from "./renderCgiFixture.js";
+import {
+  renderCgiFixture,
+  renderCgiFrameFixture,
+} from "./renderCgiFixture.js";
 import { renderNcbaFixture } from "./renderNcbaFixture.js";
 
 export function createDemoServer(
@@ -31,7 +34,19 @@ export function createDemoServer(
   app.get("/cgi-professional", (req, res) => {
     res
       .type("html")
-      .send(renderCgiFixture({ largeCandidateSet: req.query.large === "1" }));
+      .send(
+        renderCgiFixture({
+          largeCandidateSet: req.query.large === "1",
+          legacySaveLinks: req.query.legacy === "1",
+          includeFrames: req.query.frames === "1",
+          modifiedLayout: req.query.layout === "modified",
+          sameOriginFrameUrl: "/cgi-frame?frame_token=SYNTHETIC-FRAME-TOKEN",
+          crossOriginFrameUrl: `${syntheticAuthOrigin}/frame?frame_token=SYNTHETIC-CROSS-FRAME-TOKEN`,
+        }),
+      );
+  });
+  app.get("/cgi-frame", (_req, res) => {
+    res.type("html").send(renderCgiFrameFixture());
   });
   app.get("/sso-app/start", (_req, res) => {
     const returnTo = `http://127.0.0.1:${port}/sso-app/callback?session_token=SYNTHETIC-RETURN-TOKEN`;
@@ -40,7 +55,7 @@ export function createDemoServer(
     );
   });
   app.get("/sso-cgi/start", (_req, res) => {
-    const returnTo = `http://127.0.0.1:${port}/cgi-professional?session_token=SYNTHETIC-RETURN-TOKEN`;
+    const returnTo = `http://127.0.0.1:${port}/cgi-professional?legacy=1&frames=1&session_token=SYNTHETIC-RETURN-TOKEN`;
     res.redirect(
       `${syntheticAuthOrigin}/login?return_to=${encodeURIComponent(returnTo)}&bootstrap_token=SYNTHETIC-BOOTSTRAP-TOKEN`,
     );

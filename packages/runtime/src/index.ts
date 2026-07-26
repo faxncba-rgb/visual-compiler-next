@@ -1,6 +1,7 @@
 import { readFile } from "node:fs/promises";
 import {
   chromium,
+  type Frame,
   type Locator,
   type Page,
 } from "playwright";
@@ -38,9 +39,15 @@ export function isOpenAIHostname(hostname: string) {
 
 export type ExistingPageLocatorEvidence = {
   stepId: string;
+  primaryLocator: string;
   selectedLocator: string;
-  strategy: "role-name" | "role-ordinal" | "text" | "semantic-rule";
+  fallbackSelected: boolean;
+  fallbackReason?: string;
+  strategy: string;
   matchCount: number;
+  visibleCount: number;
+  enabledCount: number;
+  frame: string;
   unique: true;
 };
 
@@ -65,6 +72,15 @@ export type ExistingPageTelemetry = {
     action: SemanticStep["action"];
     status: "passed" | "failed";
     durationMs: number;
+    primaryLocator: string;
+    locatorUsed?: string;
+    fallbackSelected?: boolean;
+    fallbackReason?: string;
+    matchCount?: number;
+    visibleCount?: number;
+    enabledCount?: number;
+    frame?: string;
+    errorRedacted?: string;
   }>;
 };
 
@@ -73,6 +89,7 @@ type ResolvedExistingPageLocator = {
   evidence: ExistingPageLocatorEvidence;
 };
 type PlaywrightAriaRole = Parameters<Page["getByRole"]>[0];
+type LocatorScope = Frame;
 
 function selectedLocatorLabel(step: SemanticStep) {
   return (
@@ -98,9 +115,159 @@ async function filterEligibleLocators(
   return eligible;
 }
 
+function sameOriginScopes(page: Page, expectedOrigin: string) {
+  return page
+    .frames()
+    .filter((frame) => {
+      try {
+        return new URL(frame.url()).origin === expectedOrigin;
+      } catch {
+        return false;
+      }
+    })
+    .map((frame, index) => {
+      const frameUrl = new URL(frame.url());
+      return {
+        scope: frame,
+        id:
+          frame === page.mainFrame()
+            ? "main"
+            : frame.name() ||
+              frameUrl.pathname ||
+              `same-origin-frame-${index}`,
+      };
+    });
+}
+
+function selectorLocator(
+  scope: LocatorScope | Locator,
+  selector: string,
+): { locator: Locator; strategy: string } | null {
+  const roleName = selector.match(
+    /^role=([a-z]+)\[name=(?:"([^"]+)"|'([^']+)')\]$/,
+  );
+  if (roleName && "getByRole" in scope) {
+    return {
+      locator: scope.getByRole(roleName[1] as PlaywrightAriaRole, {
+        name: roleName[2] ?? roleName[3] ?? "",
+        exact: true,
+      }),
+      strategy: "role-name",
+    };
+  }
+  const roleOrdinal = selector.match(/^role=([a-z]+)\s*>>\s*nth=(\d+)$/);
+  if (roleOrdinal && "getByRole" in scope) {
+    return {
+      locator: scope
+        .getByRole(roleOrdinal[1] as PlaywrightAriaRole)
+        .nth(Number.parseInt(roleOrdinal[2], 10)),
+      strategy: "role-ordinal",
+    };
+  }
+  const label = selector.match(/^label=(?:"([^"]+)"|'([^']+)')$/);
+  if (label && "getByLabel" in scope) {
+    return {
+      locator: scope.getByLabel(label[1] ?? label[2] ?? "", { exact: true }),
+      strategy: "label",
+    };
+  }
+  const textSelector = selector.match(
+    /^([a-z][a-z0-9-]*):text-is\((?:"([^"]+)"|'([^']+)')\)$/,
+  );
+  if (textSelector) {
+    return {
+      locator: scope
+        .locator(textSelector[1])
+        .filter({ hasText: textSelector[2] ?? textSelector[3] ?? "" }),
+      strategy:
+        textSelector[1] === "a" ? "anchor-text" : "element-text",
+    };
+  }
+  const elementOrdinal = selector.match(
+    /^([a-z][a-z0-9-]*)\s*>>\s*nth=(\d+)$/,
+  );
+  if (elementOrdinal) {
+    return {
+      locator: scope
+        .locator(elementOrdinal[1])
+        .nth(Number.parseInt(elementOrdinal[2], 10)),
+      strategy: "element-ordinal",
+    };
+  }
+  if (selector.startsWith("text-exact=")) {
+    const text = selector.slice("text-exact=".length);
+    return {
+      locator: scope.getByText(text, { exact: true }),
+      strategy: "exact-text",
+    };
+  }
+  if (selector.startsWith("a-onclick:text-is=")) {
+    const text = selector.slice("a-onclick:text-is=".length);
+    return {
+      locator: scope.locator("a:not([href])").filter({ hasText: text }),
+      strategy: "onclick-anchor-text",
+    };
+  }
+  if (selector.startsWith("input-submit:value=")) {
+    const value = selector.slice("input-submit:value=".length);
+    return {
+      locator: scope.locator(
+        `input[type=submit][value=${JSON.stringify(value)}]`,
+      ),
+      strategy: "submit-value",
+    };
+  }
+  return null;
+}
+
+async function attemptSelector(
+  page: Page,
+  expectedOrigin: string,
+  selector: string,
+  visibleOnly: boolean,
+  enabledOnly: boolean,
+  scopedContainer?: Locator,
+) {
+  const scopes = scopedContainer
+    ? [{ scope: scopedContainer, id: "previous-step-container" }]
+    : sameOriginScopes(page, expectedOrigin);
+  const eligibleMatches: Array<{ locator: Locator; frame: string }> = [];
+  let matchCount = 0;
+  let visibleCount = 0;
+  let enabledCount = 0;
+  let strategy = "unknown";
+  for (const scopeEntry of scopes) {
+    const resolved = selectorLocator(scopeEntry.scope, selector);
+    if (!resolved) continue;
+    strategy = resolved.strategy;
+    const count = await resolved.locator.count();
+    matchCount += count;
+    for (let index = 0; index < count; index += 1) {
+      const candidate = resolved.locator.nth(index);
+      const visible = await candidate.isVisible().catch(() => false);
+      const enabled = await candidate.isEnabled().catch(() => false);
+      visibleCount += Number(visible);
+      enabledCount += Number(visible && enabled);
+      if ((!visibleOnly || visible) && (!enabledOnly || enabled)) {
+        eligibleMatches.push({ locator: candidate, frame: scopeEntry.id });
+      }
+    }
+  }
+  return {
+    selector,
+    strategy,
+    matchCount,
+    visibleCount,
+    enabledCount,
+    eligibleMatches,
+  };
+}
+
 async function resolveSelectedLocator(
   page: Page,
   step: SemanticStep,
+  expectedOrigin: string,
+  previous?: ResolvedExistingPageLocator,
 ): Promise<ResolvedExistingPageLocator> {
   const selected = step.selectedLocator;
   if (!selected) {
@@ -108,107 +275,143 @@ async function resolveSelectedLocator(
   }
   const visibleOnly = selected.rule?.visibleOnly ?? true;
   const enabledOnly = selected.rule?.enabledOnly ?? true;
-  const roleName = selected.primary.match(
-    /^role=([a-z]+)\[name=(?:"([^"]+)"|'([^']+)')\]$/,
+  const artifactFallbacks = [
+    ...step.candidates.map((candidate) => candidate.selector),
+    ...(selected.fallback ? [selected.fallback] : []),
+  ].filter((selector, index, all) => all.indexOf(selector) === index);
+  const positionalSelector = (selector: string) =>
+    /(?:^|\s>>\s)nth=\d+$/.test(selector);
+  const semanticArtifactFallbacks = artifactFallbacks.filter(
+    (selector) => !positionalSelector(selector),
   );
-  if (roleName) {
-    const role = roleName[1] as PlaywrightAriaRole;
-    const name = roleName[2] ?? roleName[3] ?? "";
-    const candidates = page.getByRole(role, { name, exact: true });
-    const eligible = await filterEligibleLocators(
-      candidates,
+  const positionalArtifactFallbacks = artifactFallbacks.filter(
+    positionalSelector,
+  );
+  const targetName =
+    step.target.accessibleName ?? selected.rule?.candidateText;
+  const synthesizedSemanticFallbacks: string[] = [];
+  if (targetName) {
+    synthesizedSemanticFallbacks.push(
+      `role=button[name="${targetName.replaceAll('"', '\\"')}"]`,
+      `text-exact=${targetName}`,
+      `button:text-is("${targetName.replaceAll('"', '\\"')}")`,
+      `input-submit:value=${targetName}`,
+      `a-onclick:text-is=${targetName}`,
+      `[role=button]:text-is("${targetName.replaceAll('"', '\\"')}")`,
+    );
+  }
+  const semanticSelectors = [
+    selected.primary,
+    ...semanticArtifactFallbacks,
+    ...synthesizedSemanticFallbacks,
+  ].filter((selector, index, all) => all.indexOf(selector) === index);
+  let primaryAttempt:
+    | Awaited<ReturnType<typeof attemptSelector>>
+    | undefined;
+  for (const [index, selector] of semanticSelectors.entries()) {
+    const attempt = await attemptSelector(
+      page,
+      expectedOrigin,
+      selector,
       visibleOnly,
       enabledOnly,
     );
-    if (eligible.length !== 1) {
-      throw new Error(
-        `Step ${step.id} selected role/name locator matched ${eligible.length} eligible elements.`,
-      );
+    if (index === 0) primaryAttempt = attempt;
+    if (attempt.eligibleMatches.length === 1) {
+      return {
+        locator: attempt.eligibleMatches[0].locator,
+        evidence: {
+          stepId: step.id,
+          primaryLocator: selected.primary,
+          selectedLocator: selector,
+          fallbackSelected: selector !== selected.primary,
+          ...(selector !== selected.primary
+            ? {
+                fallbackReason:
+                  "Primary unavailable — deterministic fallback selected.",
+              }
+            : {}),
+          strategy: attempt.strategy,
+          matchCount: attempt.matchCount,
+          visibleCount: attempt.visibleCount,
+          enabledCount: attempt.enabledCount,
+          frame: attempt.eligibleMatches[0].frame,
+          unique: true,
+        },
+      };
     }
-    return {
-      locator: candidates.nth(eligible[0]),
-      evidence: {
-        stepId: step.id,
-        selectedLocator: selected.primary,
-        strategy: "role-name",
-        matchCount: 1,
-        unique: true,
-      },
-    };
   }
-
-  const roleOrdinal = selected.primary.match(
-    /^role=([a-z]+)\s*>>\s*nth=(\d+)$/,
-  );
-  if (roleOrdinal) {
-    const role = roleOrdinal[1] as PlaywrightAriaRole;
-    const ordinal = Number.parseInt(roleOrdinal[2], 10);
-    const candidates = page.getByRole(role);
-    const eligible = await filterEligibleLocators(
-      candidates,
+  if (targetName && previous) {
+    const container = previous.locator.locator(
+      "xpath=ancestor::*[self::section or self::form or self::fieldset or self::article][1]",
+    );
+    if ((await container.count()) === 1) {
+      for (const selector of [
+        `text-exact=${targetName}`,
+        `a-onclick:text-is=${targetName}`,
+      ]) {
+        const attempt = await attemptSelector(
+          page,
+          expectedOrigin,
+          selector,
+          visibleOnly,
+          enabledOnly,
+          container,
+        );
+        if (attempt.eligibleMatches.length === 1) {
+          return {
+            locator: attempt.eligibleMatches[0].locator,
+            evidence: {
+              stepId: step.id,
+              primaryLocator: selected.primary,
+              selectedLocator: `previous-step-container >> ${selector}`,
+              fallbackSelected: true,
+              fallbackReason:
+                "Primary unavailable — deterministic fallback selected.",
+              strategy: "previous-step-dom-relation",
+              matchCount: attempt.matchCount,
+              visibleCount: attempt.visibleCount,
+              enabledCount: attempt.enabledCount,
+              frame: previous.evidence.frame,
+              unique: true,
+            },
+          };
+        }
+      }
+    }
+  }
+  for (const selector of positionalArtifactFallbacks) {
+    if (selector === selected.primary) continue;
+    const attempt = await attemptSelector(
+      page,
+      expectedOrigin,
+      selector,
       visibleOnly,
       enabledOnly,
     );
-    if (ordinal < 0 || ordinal >= eligible.length) {
-      throw new Error(
-        `Step ${step.id} selected ordinal ${ordinal} is outside ${eligible.length} eligible ${role} elements.`,
-      );
+    if (attempt.eligibleMatches.length === 1) {
+      return {
+        locator: attempt.eligibleMatches[0].locator,
+        evidence: {
+          stepId: step.id,
+          primaryLocator: selected.primary,
+          selectedLocator: selector,
+          fallbackSelected: true,
+          fallbackReason:
+            "Primary unavailable — deterministic fallback selected.",
+          strategy: attempt.strategy,
+          matchCount: attempt.matchCount,
+          visibleCount: attempt.visibleCount,
+          enabledCount: attempt.enabledCount,
+          frame: attempt.eligibleMatches[0].frame,
+          unique: true,
+        },
+      };
     }
-    return {
-      locator: candidates.nth(eligible[ordinal]),
-      evidence: {
-        stepId: step.id,
-        selectedLocator: selected.primary,
-        strategy: "role-ordinal",
-        matchCount: eligible.length,
-        unique: true,
-      },
-    };
   }
-
-  const textSelector = selected.primary.match(
-    /^([a-z][a-z0-9-]*):text-is\((?:"([^"]+)"|'([^']+)')\)$/,
+  throw new Error(
+    `Step ${step.id} locator resolution failed: primary matches=${primaryAttempt?.matchCount ?? 0}, visible=${primaryAttempt?.visibleCount ?? 0}, enabled=${primaryAttempt?.enabledCount ?? 0}; no unique deterministic fallback.`,
   );
-  if (textSelector) {
-    const tagName = textSelector[1];
-    const text = textSelector[2] ?? textSelector[3] ?? "";
-    const candidates = page.locator(tagName).filter({ hasText: text });
-    const eligible = await filterEligibleLocators(
-      candidates,
-      visibleOnly,
-      enabledOnly,
-    );
-    if (eligible.length !== 1) {
-      throw new Error(
-        `Step ${step.id} selected text locator matched ${eligible.length} eligible elements.`,
-      );
-    }
-    return {
-      locator: candidates.nth(eligible[0]),
-      evidence: {
-        stepId: step.id,
-        selectedLocator: selected.primary,
-        strategy: "text",
-        matchCount: 1,
-        unique: true,
-      },
-    };
-  }
-
-  const locator = await resolveSemanticLocator(page, step);
-  if ((await locator.count()) !== 1) {
-    throw new Error(`Step ${step.id} semantic locator is not unique.`);
-  }
-  return {
-    locator,
-    evidence: {
-      stepId: step.id,
-      selectedLocator: selected.primary,
-      strategy: "semantic-rule",
-      matchCount: 1,
-      unique: true,
-    },
-  };
 }
 
 async function resolveSemanticLocator(
@@ -294,13 +497,21 @@ async function verifyStepAssertions(
   for (const assertion of assertions) {
     if (assertion.type === "text-visible") {
       const expected = String(assertion.expected ?? assertion.target);
-      if (
-        !(await page
-          .getByText(expected, { exact: true })
-          .first()
-          .isVisible()
-          .catch(() => false))
-      ) {
+      const currentOrigin = new URL(page.url()).origin;
+      let visible = false;
+      for (const { scope } of sameOriginScopes(page, currentOrigin)) {
+        if (
+          await scope
+            .getByText(expected, { exact: true })
+            .first()
+            .isVisible()
+            .catch(() => false)
+        ) {
+          visible = true;
+          break;
+        }
+      }
+      if (!visible) {
         throw new Error("A required text precondition is not visible.");
       }
     } else if (assertion.type === "checkbox-state") {
@@ -367,8 +578,14 @@ export async function inspectWorkflowOnExistingPage(input: {
 }): Promise<ExistingPagePlannedAction[]> {
   assertPageOrigin(input.page, input.expectedOrigin);
   const plannedActions: ExistingPagePlannedAction[] = [];
+  let previous: ResolvedExistingPageLocator | undefined;
   for (const step of input.workflow.steps) {
-    const resolved = await resolveSelectedLocator(input.page, step);
+    const resolved = await resolveSelectedLocator(
+      input.page,
+      step,
+      input.expectedOrigin,
+      previous,
+    );
     await verifyStepAssertions(
       input.page,
       resolved.locator,
@@ -383,6 +600,7 @@ export async function inspectWorkflowOnExistingPage(input: {
       locator: resolved.evidence,
       preconditionsPassed: true,
     });
+    previous = resolved;
   }
   return plannedActions;
 }
@@ -391,6 +609,7 @@ export async function runWorkflowOnExistingPage(input: {
   page: Page;
   workflow: SemanticWorkflow;
   expectedOrigin: string;
+  signal?: AbortSignal;
 }): Promise<ExistingPageTelemetry> {
   const startedAt = new Date().toISOString();
   const started = Date.now();
@@ -419,29 +638,63 @@ export async function runWorkflowOnExistingPage(input: {
       }),
   );
   assertPageOrigin(input.page, input.expectedOrigin);
+  let previous: ResolvedExistingPageLocator | undefined;
   for (const step of input.workflow.steps) {
     const stepStarted = Date.now();
+    let resolved: ResolvedExistingPageLocator | undefined;
     try {
-      const resolved = await resolveSelectedLocator(input.page, step);
+      if (input.signal?.aborted) throw new Error("Execution stopped by operator.");
+      resolved = await resolveSelectedLocator(
+        input.page,
+        step,
+        input.expectedOrigin,
+        previous,
+      );
       await verifyStepAssertions(
         input.page,
         resolved.locator,
         step.preconditions,
       );
       await runStepWithTarget(input.page, step, resolved.locator);
+      if (input.signal?.aborted) throw new Error("Execution stopped by operator.");
       assertPageOrigin(input.page, input.expectedOrigin);
       steps.push({
         stepId: step.id,
         action: step.action,
         status: "passed",
         durationMs: Date.now() - stepStarted,
+        primaryLocator: resolved.evidence.primaryLocator,
+        locatorUsed: resolved.evidence.selectedLocator,
+        fallbackSelected: resolved.evidence.fallbackSelected,
+        fallbackReason: resolved.evidence.fallbackReason,
+        matchCount: resolved.evidence.matchCount,
+        visibleCount: resolved.evidence.visibleCount,
+        enabledCount: resolved.evidence.enabledCount,
+        frame: resolved.evidence.frame,
       });
-    } catch {
+      previous = resolved;
+    } catch (error) {
       steps.push({
         stepId: step.id,
         action: step.action,
         status: "failed",
         durationMs: Date.now() - stepStarted,
+        primaryLocator: step.selectedLocator?.primary ?? "missing",
+        ...(resolved
+          ? {
+              locatorUsed: resolved.evidence.selectedLocator,
+              fallbackSelected: resolved.evidence.fallbackSelected,
+              fallbackReason: resolved.evidence.fallbackReason,
+              matchCount: resolved.evidence.matchCount,
+              visibleCount: resolved.evidence.visibleCount,
+              enabledCount: resolved.evidence.enabledCount,
+              frame: resolved.evidence.frame,
+            }
+          : {}),
+        errorRedacted:
+          error instanceof Error && /stopped by operator/i.test(error.message)
+            ? "Execution stopped by operator."
+            : "Locator, precondition, action, or postcondition failed.",
       });
       break;
     }

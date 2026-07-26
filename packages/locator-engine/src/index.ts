@@ -106,20 +106,37 @@ export function generateCandidates(
 ): ResolvedCandidate[] {
   const relation = step.target.relations[0];
   const role = step.target.role ?? defaultRole(step);
-  const nodes = candidateRoleNodes(model, role).filter((node) => {
+  const roleNodes = candidateRoleNodes(model, role);
+  const clickableFallbackNodes =
+    step.action === "click"
+      ? model.nodes.filter(
+          (node) =>
+            node.visible &&
+            node.enabled &&
+            node.hasClickHandler === true &&
+            Boolean(node.controlText || node.accessibleName),
+        )
+      : [];
+  const nodes = [...roleNodes, ...clickableFallbackNodes]
+    .filter(
+      (node, index, all) =>
+        all.findIndex((candidate) => candidate.id === node.id) === index,
+    )
+    .filter((node) => {
     if (step.target.state === "enabled") return node.enabled;
     if (step.target.state === "disabled") return !node.enabled;
     if (step.target.state === "checked") return node.checked === true;
     if (step.target.state === "unchecked") return node.checked !== true;
     return true;
-  });
+    });
   const targetName = normalized(step.target.accessibleName);
   const results: ResolvedCandidate[] = [];
   let fallbackOrder = 0;
 
   if (targetName) {
     const roleNameMatches = nodes.filter(
-      (node) => normalized(node.accessibleName) === targetName,
+      (node) =>
+        node.role === role && normalized(node.accessibleName) === targetName,
     );
     for (const node of roleNameMatches) {
       results.push(
@@ -294,18 +311,23 @@ export function generateCandidates(
       (b.visualOrder ?? b.domOrder ?? 0),
   );
   for (const [index, node] of orderedNodes.entries()) {
-    results.push(
-      candidate(
-        "relative-dom",
-        `role=${role} >> nth=${index}`,
-        0.68,
-        true,
-        0.66,
-        "Deterministic role ordinal in visual order.",
-        fallbackOrder++,
-        node,
-      ),
-    );
+    if (node.role === role) {
+      const roleIndex = orderedNodes
+        .filter((candidate) => candidate.role === role)
+        .findIndex((candidate) => candidate.id === node.id);
+      results.push(
+        candidate(
+          "relative-dom",
+          `role=${role} >> nth=${roleIndex}`,
+          0.68,
+          true,
+          0.66,
+          "Deterministic role ordinal in visual order.",
+          fallbackOrder++,
+          node,
+        ),
+      );
+    }
     results.push(
       candidate(
         "relative-dom",

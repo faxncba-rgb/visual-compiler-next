@@ -1,6 +1,16 @@
 export function renderCgiFixture(
-  options: { largeCandidateSet?: boolean } = {},
+  options: {
+    largeCandidateSet?: boolean;
+    legacySaveLinks?: boolean;
+    includeFrames?: boolean;
+    sameOriginFrameUrl?: string;
+    crossOriginFrameUrl?: string;
+    modifiedLayout?: boolean;
+  } = {},
 ) {
+  const saveControl = options.legacySaveLinks
+    ? `<a class="save" onclick="saveForm(this)">Enregistrer</a>`
+    : `<button type="button" class="save">Enregistrer</button>`;
   const largeCandidateSet = options.largeCandidateSet
     ? `<section aria-labelledby="bulk-heading">
       <h2 id="bulk-heading">Commandes administratives secondaires</h2>
@@ -24,7 +34,7 @@ export function renderCgiFixture(
     section{margin:18px 0;padding:18px;border:1px solid #bcc8d3;border-radius:8px;background:white}
     label{display:block;margin:10px 0 6px;font-weight:700}
     textarea{box-sizing:border-box;width:100%;min-height:120px;padding:10px;font:inherit}
-    button{margin-top:12px;padding:10px 18px;font:inherit}
+    button,a.save{display:inline-block;margin-top:12px;padding:10px 18px;font:inherit;color:#073b66;border:1px solid #7d9bb5;cursor:pointer}
     [role=status]{font-weight:700;color:#176a43}
   </style>
 </head>
@@ -34,11 +44,12 @@ export function renderCgiFixture(
     <h1>Application CGI administrative synthétique</h1>
     <p>Fixture locale sans code, contenu ou marque provenant d’un DPI réel.</p>
 
+    ${options.modifiedLayout ? "<aside><h2>Navigation synthétique ajoutée</h2></aside>" : ""}
     <section aria-labelledby="observation-heading">
       <h2 id="observation-heading">Compte rendu administratif</h2>
       <label for="observation">Observation du praticien</label>
       <textarea id="observation" name="observation" placeholder="Saisir une observation administrative">VALEUR-SYNTHETIQUE-A-SUPPRIMER</textarea>
-      <button type="button" class="save">Enregistrer</button>
+      ${saveControl}
       <p id="observation-result" role="status">Aucune modification enregistrée.</p>
     </section>
 
@@ -46,24 +57,49 @@ export function renderCgiFixture(
       <h2 id="correspondence-heading">Correspondance interne</h2>
       <label for="internal-note">Notes internes</label>
       <textarea id="internal-note" name="internal-note" placeholder="Saisir une note interne">AUTRE-VALEUR-SYNTHETIQUE-SECRETE</textarea>
-      <button type="button" class="save">Enregistrer</button>
+      ${saveControl}
       <p id="internal-result" role="status">Aucune note enregistrée.</p>
     </section>
     ${largeCandidateSet}
+    ${
+      options.includeFrames
+        ? `<iframe name="administrative-frame" title="Administrative same-origin frame" src="${options.sameOriginFrameUrl ?? "/cgi-frame"}"></iframe>
+    <iframe title="Excluded cross-origin support frame" src="${options.crossOriginFrameUrl ?? "about:blank"}"></iframe>`
+        : ""
+    }
 
     <input type="hidden" name="session_token" value="TOKEN-SYNTHETIQUE-EXCLU">
   </main>
   <script>
     const sections = Array.from(document.querySelectorAll("section"));
-    sections[0].querySelector("button").addEventListener("click", () => {
+    window.saveForm = (control) => {
+      const section = control.closest("section");
+      if (section?.querySelector("#observation-result")) {
+        document.getElementById("observation-result").textContent =
+          "Enregistrement synthétique effectué";
+      } else if (section?.querySelector("#internal-result")) {
+        document.getElementById("internal-result").textContent =
+          "Note synthétique enregistrée";
+      }
+    };
+    sections[0].querySelector(".save").addEventListener("click", () => {
       document.getElementById("observation-result").textContent =
         "Enregistrement synthétique effectué";
     });
-    sections[1].querySelector("button").addEventListener("click", () => {
+    sections[1].querySelector(".save").addEventListener("click", () => {
       document.getElementById("internal-result").textContent =
         "Note synthétique enregistrée";
     });
   </script>
 </body>
 </html>`;
+}
+
+export function renderCgiFrameFixture() {
+  return `<!doctype html><html lang="fr"><head><meta charset="utf-8"><title>Frame CGI synthétique</title></head>
+  <body><section aria-labelledby="frame-heading"><h2 id="frame-heading">Zone administrative encadrée</h2>
+  <label for="frame-note">Frame observation</label>
+  <textarea id="frame-note">VALEUR-FRAME-A-SUPPRIMER</textarea>
+  <a onclick="document.getElementById('frame-result').textContent='Frame enregistrée'">Enregistrer frame</a>
+  <p id="frame-result" role="status">Frame en attente</p></section></body></html>`;
 }

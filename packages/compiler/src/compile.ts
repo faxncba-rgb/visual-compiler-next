@@ -224,6 +224,7 @@ export async function compileWorkflow(
 
 export {
   CGI_FIXTURE_INSTRUCTION,
+  CGI_FIXTURE_SECOND_INSTRUCTION,
   createRedactedCompilerPageModel,
   InterpreterResponseSchema,
   interpreterResponseFormat,

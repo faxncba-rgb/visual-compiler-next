@@ -22,7 +22,7 @@ test("Studio remains usable at an iPhone Safari viewport", async ({ page }) => {
   await expect(
     page.getByRole("heading", { name: "Visual Compiler" }),
   ).toBeVisible();
-  await expect(page.getByRole("button", { name: "Compile" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Compile", exact: true })).toBeVisible();
   await expect(page.getByLabel("Compiled workflow")).toHaveValue(
     "pending-review.workflow",
   );

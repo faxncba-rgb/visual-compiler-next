@@ -66,7 +66,7 @@ async function openAuthenticateAndLock(
 }
 
 async function capture(page: import("@playwright/test").Page) {
-  await page.getByRole("button", { name: "Capture" }).click();
+  await page.getByRole("button", { name: "Capture", exact: true }).click();
   await expect(page.locator("#status")).toHaveText("Redacted capture ready");
   await page.locator("#compilerPayloadConfirmation").check();
 }
@@ -97,7 +97,7 @@ test("locked Training page runs an explicitly confirmed Draft on the existing ma
       response.url() === `${studioOrigin}/api/compile` &&
       response.request().method() === "POST",
   );
-  await page.getByRole("button", { name: "Compile" }).click();
+  await page.getByRole("button", { name: "Compile", exact: true }).click();
   const compileResponse = await compileResponsePromise;
   expect(
     compileResponse.ok(),
@@ -235,6 +235,7 @@ test("locked Training page runs an explicitly confirmed Draft on the existing ma
   );
   expect(await syntheticState.json()).toEqual({
     expectedSyntheticValuePresent: true,
+    secondSyntheticValuePresent: false,
     savePostconditionVisible: true,
     llmCalls: 0,
     openAIRequests: 0,

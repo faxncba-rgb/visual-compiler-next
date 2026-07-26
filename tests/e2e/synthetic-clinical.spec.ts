@@ -98,8 +98,8 @@ test("Studio visibly demonstrates capture through promoted A/B execution", async
     page.getByText(/synthetic environment.*no patient data/i),
   ).toBeVisible();
 
-  const capture = page.getByRole("button", { name: "Capture" });
-  const compile = page.getByRole("button", { name: "Compile" });
+  const capture = page.getByRole("button", { name: "Capture", exact: true });
+  const compile = page.getByRole("button", { name: "Compile", exact: true });
   await expect(capture).toBeDisabled();
   await expect(compile).toBeDisabled();
   for (const checkbox of await page
@@ -226,7 +226,7 @@ test("profile selection performs no navigation and compilation is attestation-ga
     "srcdoc",
     /Studio will not contact/,
   );
-  await expect(page.getByRole("button", { name: "Compile" })).toBeDisabled();
+  await expect(page.getByRole("button", { name: "Compile", exact: true })).toBeDisabled();
   expect(ncbaRequests).toEqual([]);
 
   const dynamicTrainingUrl = `${syntheticApplicationOrigin}/sso-app/start?patient_id=FAKE-E2E&mytime=123456`;
@@ -420,8 +420,8 @@ test("managed Training completes synthetic popup SSO before strict application l
       phase: "authentication-bootstrap",
       currentOrigin: "http://127.0.0.1:4275",
     });
-  await expect(page.getByRole("button", { name: "Capture" })).toBeDisabled();
-  await expect(page.getByRole("button", { name: "Compile" })).toBeDisabled();
+  await expect(page.getByRole("button", { name: "Capture", exact: true })).toBeDisabled();
+  await expect(page.getByRole("button", { name: "Compile", exact: true })).toBeDisabled();
 
   const captureDuringAuthentication = await page.request.post(
     `${studioOrigin}/api/capture`,
@@ -490,9 +490,9 @@ test("managed Training completes synthetic popup SSO before strict application l
   await expect(page.locator("#authenticationState")).toContainText(
     "APPLICATION LOCKED",
   );
-  await expect(page.getByRole("button", { name: "Capture" })).toBeEnabled();
+  await expect(page.getByRole("button", { name: "Capture", exact: true })).toBeEnabled();
 
-  await page.getByRole("button", { name: "Capture" }).click();
+  await page.getByRole("button", { name: "Capture", exact: true }).click();
   await expect(page.locator("#status")).toHaveText("Redacted capture ready");
   await expect(page.locator("#redactionReport")).toContainText(
     '"cookiesCaptured": false',
@@ -502,9 +502,9 @@ test("managed Training completes synthetic popup SSO before strict application l
     expect(captureReportText).not.toContain(forbidden);
   }
 
-  await expect(page.getByRole("button", { name: "Compile" })).toBeDisabled();
+  await expect(page.getByRole("button", { name: "Compile", exact: true })).toBeDisabled();
   await page.locator("#compilerPayloadConfirmation").check();
-  await page.getByRole("button", { name: "Compile" }).click();
+  await page.getByRole("button", { name: "Compile", exact: true }).click();
   await expect(page.locator("#status")).toContainText("Draft", {
     timeout: 15_000,
   });

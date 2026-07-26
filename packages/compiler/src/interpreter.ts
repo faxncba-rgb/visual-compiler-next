@@ -90,6 +90,7 @@ export function createRedactedCompilerPageModel(model: PageModel) {
       node.visible &&
       node.attributes.type !== "hidden" &&
       (interactiveRoles.has(node.role ?? "") ||
+        node.hasClickHandler === true ||
         structuralTags.has(node.tagName)),
   );
   const includedIds = new Set(included.map((node) => node.id));
@@ -178,6 +179,8 @@ export function createRedactedCompilerPageModel(model: PageModel) {
       ariaLabelledByText,
       placeholder,
       controlText,
+      hasClickHandler: node.hasClickHandler === true,
+      frame: node.frame,
       structuralHeading,
       texts,
       box: node.box,
@@ -245,7 +248,7 @@ export function createRedactedCompilerPageModel(model: PageModel) {
       nodesCaptured: model.nodes.length,
       nodesIncluded: nodes.length,
       interactiveElements: nodes.filter((node) =>
-        interactiveRoles.has(node.role ?? ""),
+        interactiveRoles.has(node.role ?? "") || node.hasClickHandler,
       ).length,
       accessibleNamesKept,
       labelsKept,
@@ -352,12 +355,22 @@ function normalizeInstruction(instruction: string) {
 
 export const CGI_FIXTURE_INSTRUCTION =
   "Dans la zone de texte, écris « test du DR LEROY », puis clique sur « Enregistrer ».";
+export const CGI_FIXTURE_SECOND_INSTRUCTION =
+  "Dans la zone de texte, écris « second test synthétique », puis clique sur « Enregistrer ».";
 
 export function mockInterpretInstruction(
   instruction = DEFAULT_INSTRUCTION,
 ): InterpreterResponse {
   const normalizedInstruction = normalizeInstruction(instruction);
-  if (normalizedInstruction === normalizeInstruction(CGI_FIXTURE_INSTRUCTION)) {
+  if (
+    normalizedInstruction === normalizeInstruction(CGI_FIXTURE_INSTRUCTION) ||
+    normalizedInstruction ===
+      normalizeInstruction(CGI_FIXTURE_SECOND_INSTRUCTION)
+  ) {
+    const requestedValue =
+      normalizedInstruction === normalizeInstruction(CGI_FIXTURE_INSTRUCTION)
+        ? "test du DR LEROY"
+        : "second test synthétique";
     return InterpreterResponseSchema.parse({
       name: "Synthetic CGI administrative note",
       assumptions: [
@@ -386,7 +399,7 @@ export function mockInterpretInstruction(
               },
             ],
           },
-          value: "test du DR LEROY",
+          value: requestedValue,
           preconditions: [
             {
               type: "element-visible",

@@ -1,4 +1,4 @@
-import type { Page } from "playwright";
+import type { Frame, Page } from "playwright";
 import type { Box } from "@visual-compiler/spatial";
 
 export type PageNode = {
@@ -12,6 +12,13 @@ export type PageNode = {
   ariaLabelledByText?: string;
   placeholder?: string;
   controlText?: string;
+  hasClickHandler?: boolean;
+  frame?: {
+    name?: string;
+    title?: string;
+    pathname: string;
+    index?: number;
+  };
   structuralHeading?: string;
   text: string;
   box: Box;
@@ -35,8 +42,11 @@ export type PageModel = {
   capturedAt: string;
 };
 
-export async function extractPageModel(page: Page): Promise<PageModel> {
-  const viewport = page.viewportSize() ?? { width: 1280, height: 720 };
+export async function extractPageModel(page: Page | Frame): Promise<PageModel> {
+  const viewport =
+    "viewportSize" in page
+      ? (page.viewportSize() ?? { width: 1280, height: 720 })
+      : (page.page().viewportSize() ?? { width: 1280, height: 720 });
   // Keep this evaluator as a string. TS-on-the-fly loaders can inject helper
   // references into serialized functions that do not exist in the browser.
   const nodes = await page.evaluate<PageNode[]>(String.raw`(() => {
@@ -71,7 +81,11 @@ export async function extractPageModel(page: Page): Promise<PageModel> {
       }
       if (tag === "select") return "combobox";
       if (tag === "option") return "option";
-      if (tag === "a") return "link";
+      if (
+        tag === "a" &&
+        (el.hasAttribute("href") || el.getAttribute("role") === "link")
+      )
+        return "link";
       if (/^h[1-6]$/.test(tag)) return "heading";
       if (tag === "tr") return "row";
       if (tag === "td" || tag === "th") return "cell";
@@ -215,6 +229,10 @@ export async function extractPageModel(page: Page): Promise<PageModel> {
           ariaLabelledByText,
           placeholder,
           controlText,
+          hasClickHandler:
+            el.hasAttribute("onclick") ||
+            typeof el.onclick === "function" ||
+            el.getAttribute("role") === "button",
           structuralHeading: headingFor(el),
           text: interfaceTextFor(el),
           box: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },

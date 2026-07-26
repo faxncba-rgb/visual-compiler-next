@@ -32,7 +32,7 @@ test("a CGI-style page without stable test labels compiles textarea and Save loc
       response.url() === `${studioOrigin}/api/capture` &&
       response.request().method() === "POST",
   );
-  await page.getByRole("button", { name: "Capture" }).click();
+  await page.getByRole("button", { name: "Capture", exact: true }).click();
   const captureBody = await (await captureResponsePromise).json();
   await expect(page.locator("#status")).toHaveText("Redacted capture ready");
   const previewText = await page.locator("#compilerPayloadPreview").innerText();
@@ -117,15 +117,15 @@ test("a CGI-style page without stable test labels compiles textarea and Save loc
     error: expect.stringContaining("confirm"),
   });
 
-  await expect(page.getByRole("button", { name: "Compile" })).toBeDisabled();
+  await expect(page.getByRole("button", { name: "Compile", exact: true })).toBeDisabled();
   await page.locator("#compilerPayloadConfirmation").check();
-  await expect(page.getByRole("button", { name: "Compile" })).toBeEnabled();
+  await expect(page.getByRole("button", { name: "Compile", exact: true })).toBeEnabled();
   const compactCompileResponsePromise = page.waitForResponse(
     (response) =>
       response.url() === `${studioOrigin}/api/compile` &&
       response.request().method() === "POST",
   );
-  await page.getByRole("button", { name: "Compile" }).click();
+  await page.getByRole("button", { name: "Compile", exact: true }).click();
   await expect(page.locator("#status")).toContainText("Draft");
   const compactResponse = await compactCompileResponsePromise;
   const compactText = await compactResponse.text();

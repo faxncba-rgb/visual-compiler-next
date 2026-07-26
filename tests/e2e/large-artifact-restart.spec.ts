@@ -69,7 +69,7 @@ async function attestAndCapture(page: Page) {
       response.url() === `${studioOrigin}/api/capture` &&
       response.request().method() === "POST",
   );
-  await page.getByRole("button", { name: "Capture" }).click();
+  await page.getByRole("button", { name: "Capture", exact: true }).click();
   const capture = await (await captureResponsePromise).json();
   await expect(page.locator("#status")).toHaveText("Redacted capture ready");
   await page.locator("#compilerPayloadConfirmation").check();
@@ -105,7 +105,7 @@ test("a >100 KB artifact is compactly acknowledged, persisted, restarted and res
         request.url() === `${studioOrigin}/api/compile` &&
         request.method() === "POST",
     );
-    const compileButton = page.getByRole("button", { name: "Compile" });
+    const compileButton = page.getByRole("button", { name: "Compile", exact: true });
     await page.locator("#compile").evaluate((button: HTMLButtonElement) => {
       button.click();
       button.click();
