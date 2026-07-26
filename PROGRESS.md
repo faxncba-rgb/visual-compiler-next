@@ -10,6 +10,7 @@
 - Added two mock-only CGI instructions and fixture coverage for synthetic SSO, dynamic query strings, duplicate textareas/save controls, legacy onclick anchors, same/cross-origin frames, structural modification, repeat execution, recovery, stop, and zero runtime model/network calls.
 - Final validation after `npm ci`: zero audit vulnerabilities; build passed; 53/53 unit and integration tests passed; 9/9 focused security tests plus an 82-file scan passed; and 15/15 Playwright E2E tests passed.
 - Visual loopback verification confirmed the visible Lab banner/progress/actions, one confirmation, synthetic SSO bootstrap, `APPLICATION LOCKED`, automatic capture, two-step Draft compilation, a passed run, enabled **Run again**, actual DOM-scoped legacy-anchor fallback, and `llmCalls: 0` / `openAIRequests: 0`. Mock telemetry now states `offline-mock (no model served)`.
+- The first push CI exposed an ordering-only failure: browser-backed unit tests ran before Chromium installation. The workflow now installs the pinned Playwright Chromium browser before `npm test`; no product-code change was required.
 - No request was made to the NCBA DPI or OpenAI. No patient data, authentication state, or real captured payload was used. The ignored real artifact remains local and its required SHA-256 is checked again before commit.
 
 ## 2026-07-25 — Locked Training-page test execution
