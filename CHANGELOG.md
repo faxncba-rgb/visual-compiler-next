@@ -11,6 +11,12 @@
 
 ## Unreleased
 
+- Added a loopback-only Lab Mode with one synthetic-session confirmation, automatic capture reuse, explicit compile/restore, direct Draft testing, repeat runs, stop, and reset controls.
+- Added a seven-stage Lab progress display with bounded operations, concurrent-call refusal, redacted compile/run telemetry, and reusable failure states.
+- Corrected legacy CGI anchors without `href`: page modeling retains only safe onclick presence, while runtime uses unique semantic/DOM fallbacks before positional selectors and reports the actual candidate used.
+- Added same-origin frame modeling/execution and complete cross-origin frame exclusion from compiler payloads.
+- Added a synthetic SSO-to-CGI Lab E2E covering automatic capture, mock compilation, role-link miss, deterministic fallback, Run again, a second instruction, structural recapture, stop, reset, and zero OpenAI calls.
+
 - Added visible fixture, NCBA training, and NCBA clinical profile selection in Studio.
 - Added explicit managed-browser opening with isolated local state and no automatic navigation.
 - Enforced fresh synthetic-data attestation before capture or compilation and technical clinical compilation/capture denial.

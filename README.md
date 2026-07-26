@@ -57,6 +57,28 @@ Draft and subsequent lifecycle state are persisted locally in restricted sidecar
 
 For an authorized synthetic Training session, a restored Draft can be tested directly on the already open `APPLICATION LOCKED` page. Studio first displays the workflow-provided values, selected locators, and a fail-closed local preflight. The separate **Test run on locked Training page** control requires explicit confirmation, performs no retry, never launches another browser, and may transition only `Draft → Validated`. It never approves or promotes automatically. Run A/B remain local Build Week fixture replays and must not be used for the managed Training page.
 
+## Local Lab Mode
+
+`VISUAL_COMPILER_LAB_MODE=true` enables a deliberately local-only Training shortcut. It is active only when Studio binds to `127.0.0.1`, `localhost`, or `::1`, the selected profile is Training or the local fixture, and the operator has confirmed once that the browser session contains synthetic test records only. It is never available in Clinical mode.
+
+Lab Mode keeps the privacy and runtime boundaries while removing repeated prototype confirmations. Its top-of-Studio journey is **Browser → Locked → Captured → Compiled → Ready → Running → Passed / Failed**, with **Capture now**, **Compile**, **Run on current page**, **Run again**, **Recapture and compile**, **Stop**, and **Reset test session**. Capture is refreshed automatically only when the canonical page or structural fingerprint changed. Compilation still occurs only after a human click; a compatible artifact is restored with `modelCalls: 0`.
+
+The existing-page runtime tests the selected primary locator against Playwright first, then ordered semantic candidates and deterministic fallbacks. Legacy `<a onclick>` controls without `href` are not misclassified as accessible links, handler source is never retained, and a unique text/DOM fallback may be scoped to the previous step's form or section before any ordinal fallback. Same-origin frames are captured and resolved with redacted identity; cross-origin frames are excluded from compiler input.
+
+To test or restore existing artifacts with no model call:
+
+```bash
+VISUAL_COMPILER_LAB_MODE=true USE_LIVE_OPENAI=false STUDIO_HOST=127.0.0.1 npm run dev
+```
+
+To permit a new, explicit human-clicked compilation in an authorized synthetic session:
+
+```bash
+VISUAL_COMPILER_LAB_MODE=true USE_LIVE_OPENAI=true OPENAI_COMPILE_MODEL=gpt-5.6 STUDIO_HOST=127.0.0.1 npm run dev
+```
+
+No API key belongs in either command, the repository, Studio, or documentation. Live compilation remains a separately authorized operator action; it is never used by tests.
+
 ## Local use
 
 ```bash

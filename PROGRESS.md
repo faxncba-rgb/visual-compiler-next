@@ -1,5 +1,17 @@
 # Progress
 
+## 2026-07-25 — Local Lab Mode and legacy CGI replay
+
+- Added explicit `VISUAL_COMPILER_LAB_MODE=true`, restricted to a loopback-bound Studio, Training/fixture profiles, and one in-memory synthetic-record confirmation per session. Clinical mode refuses the Lab endpoints and never renders the Lab panel.
+- Added the visible seven-stage Lab journey and the controls **Capture now**, **Compile**, **Run on current page**, **Run again**, **Recapture and compile**, **Stop**, and **Reset test session**. Long operations are bounded, concurrent compile/run requests are refused, and controls recover after success, failure, or stop.
+- Lab capture uses the current locked Playwright page, canonicalizes to `origin + pathname`, reuses an unchanged capture, restores compatible artifacts without a model call, and requires a human Compile click before any new compilation. Drafts may run directly only on the locked synthetic Training page; successful runs may validate but never approve or promote automatically.
+- Corrected old-CGI semantics: `<a onclick>` without `href` is no longer assigned a link role, only the presence of a handler is retained, and handler source is discarded. Runtime resolution now records primary/fallback/count/frame evidence, tries unique semantic and previous-section fallbacks before positional ordinals, and refuses ambiguity.
+- Added same-origin frame capture/resolution and complete cross-origin frame exclusion. No query parameters, pre-existing form values, cookie, storage, header, token, network response, or cross-origin frame content reaches compiler input, telemetry, logs, or artifacts.
+- Added two mock-only CGI instructions and fixture coverage for synthetic SSO, dynamic query strings, duplicate textareas/save controls, legacy onclick anchors, same/cross-origin frames, structural modification, repeat execution, recovery, stop, and zero runtime model/network calls.
+- Final validation after `npm ci`: zero audit vulnerabilities; build passed; 53/53 unit and integration tests passed; 9/9 focused security tests plus an 82-file scan passed; and 15/15 Playwright E2E tests passed.
+- Visual loopback verification confirmed the visible Lab banner/progress/actions, one confirmation, synthetic SSO bootstrap, `APPLICATION LOCKED`, automatic capture, two-step Draft compilation, a passed run, enabled **Run again**, actual DOM-scoped legacy-anchor fallback, and `llmCalls: 0` / `openAIRequests: 0`. Mock telemetry now states `offline-mock (no model served)`.
+- No request was made to the NCBA DPI or OpenAI. No patient data, authentication state, or real captured payload was used. The ignored real artifact remains local and its required SHA-256 is checked again before commit.
+
 ## 2026-07-25 — Locked Training-page test execution
 
 - Added a distinct **Test run on locked Training page** path that reuses the already open managed Playwright `Page`; it never launches a second browser, exports authentication state, or calls a model.

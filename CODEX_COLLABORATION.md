@@ -26,6 +26,15 @@ workflow, call OpenAI, export browser state, or include dynamic URLs and page
 values in telemetry. A successful Training test may validate a Draft only;
 approval and promotion remain distinct human decisions.
 
+For the Lab Mode milestone, Codex must keep `USE_LIVE_OPENAI=false` for every
+automated and visual test, use only the loopback synthetic SSO/CGI fixtures, and
+never open the NCBA domain. The ignored real workflow artifact is immutable and
+must remain local. Lab Mode may reduce repeated confirmations only for a
+loopback-bound Training/fixture session; it must remain absent and technically
+refused in Clinical mode. Old-CGI and frame support may retain structural
+semantics only—never onclick source, field values, cross-origin frame content,
+query parameters, cookies, storage, headers, or authentication state.
+
 ## Components Codex Designed
 
 - Monorepo structure separating compile-time and runtime packages.

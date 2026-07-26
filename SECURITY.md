@@ -25,3 +25,21 @@ Artifact loading performs schema, URL, sensitive-key and token-pattern checks.
 Draft restoration additionally requires a fresh confirmed capture, compatible
 fingerprint and unique selected locators. The OpenAI client has a bounded
 timeout and zero automatic retries; runtime OpenAI blocking is unchanged.
+
+Lab Mode is an explicit local prototype surface, not a clinical-policy bypass.
+It activates only with `VISUAL_COMPILER_LAB_MODE=true`, a loopback Studio host,
+a Training/fixture profile, and a short-lived in-memory synthetic-session token.
+Clinical profile requests are rejected server-side. The shortcut removes
+repeated human confirmations but preserves canonical URL handling, exact locked
+application origin, OpenAI HTTP/WebSocket blocking, value/storage/cookie/network
+redaction, cross-origin frame exclusion, deterministic locator uniqueness, and
+zero-call runtime telemetry. Lab tokens, full navigation URLs, browser state,
+and authentication origins are never persisted.
+
+For legacy CGI controls, the page model records `hasClickHandler: true` but
+never the handler source. Anchors without `href` or an explicit link role are
+not represented as accessible links. Runtime fallback selection is local and
+deterministic; it stops closed when no single visible and enabled target exists.
+Same-origin frame identity contains only name/title/canonical pathname (index as
+a last resort), while cross-origin frame DOM is never added to capture or model
+payloads.

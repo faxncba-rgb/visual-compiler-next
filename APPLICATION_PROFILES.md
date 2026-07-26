@@ -19,3 +19,11 @@ Changing the selection updates labels and URL fields only. It performs no naviga
 For `ncba-dpi-training`, allowlisting compares `new URL(target).origin` with the configured origin. HTTPS path and query changes on that exact origin are accepted, while sibling subdomains, HTTP, credential-bearing URLs, and forbidden schemes remain rejected.
 
 After explicit opening, `AUTHENTICATION BOOTSTRAP` temporarily accepts HTTPS SSO redirects and popups without creating any capture or compiler input. The operator authenticates manually. Locking is refused until the primary page returns to the exact application origin. After the visible **Authentication complete — lock to application** action, `APPLICATION LOCKED` enforces that origin for primary-page navigation. Query strings remain memory-only and are removed before diagnostics, compiler input, artifacts, fingerprints, and audits.
+
+Local Lab Mode may be enabled for `ncba-dpi-fixture` and
+`ncba-dpi-training` only. In addition to the environment flag, Studio must bind
+to loopback and the operator must make the single synthetic-record confirmation
+for the current in-memory session. `ncba-dpi-clinical` rejects confirmation,
+capture, compile, and Lab-run requests. The Lab shortcut changes workflow
+friction only: it does not weaken origin locking, URL canonicalization,
+redaction, cross-origin-frame exclusion, or OpenAI blocking.
