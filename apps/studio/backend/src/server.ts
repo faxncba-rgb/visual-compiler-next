@@ -30,6 +30,7 @@ import {
   runCompiledWorkflow,
   runWorkflowOnExistingPage,
   type ExistingPagePlannedAction,
+  type ExistingPageProgress,
 } from "@visual-compiler/runtime";
 import {
   createStudioApplicationProfiles,
@@ -86,6 +87,14 @@ const labSessions = new Map<
   { confirmedAt: string; expiresAt: number }
 >();
 const activeLabRuns = new Map<StudioProfileId, AbortController>();
+const labRunProgress = new Map<
+  StudioProfileId,
+  {
+    running: boolean;
+    current?: ExistingPageProgress;
+    updatedAt: string;
+  }
+>();
 const LAB_SESSION_TTL_MS = 12 * 60 * 60_000;
 const COMPILE_RESPONSE_TIMEOUT_MS = 180_000;
 const compileProgressDelayMs = Math.max(
@@ -241,9 +250,7 @@ const trainingExecutionPreflights = new Map<
 const TRAINING_EXECUTION_PREFLIGHT_TTL_MS = 5 * 60_000;
 
 function isLabProfile(profileId: StudioProfileId) {
-  return (
-    profileId === "ncba-dpi-training" || profileId === "ncba-dpi-fixture"
-  );
+  return profileId === "ncba-dpi-training" || profileId === "ncba-dpi-fixture";
 }
 
 function isLabAuthorized(token: unknown, profileId: StudioProfileId) {
@@ -813,7 +820,9 @@ async function prepareLockedTrainingExecution(
   }
   const configuredOrigin = new URL(managedTrainingOrigin).origin;
   if (session.applicationOrigin !== configuredOrigin) {
-    throw new Error("The managed application origin is not the Training origin.");
+    throw new Error(
+      "The managed application origin is not the Training origin.",
+    );
   }
   const currentUrl = new URL(session.primaryPage.url());
   if (currentUrl.origin !== configuredOrigin) {
@@ -1263,6 +1272,7 @@ function studioHtml() {
           <button type="button" id="labStop" disabled>Stop</button>
           <button type="button" id="labReset" disabled>Reset test session</button>
         </div>
+        <div class="authentication-state" id="labRuntimePhase" aria-live="polite">Runtime ready — no active action.</div>
         <pre id="labResult">Confirm the synthetic Lab session once to begin.</pre>
       </section>
       <section class="mode-panel" id="activeProfilePanel" aria-label="Active application profile">
@@ -2439,7 +2449,29 @@ OpenAI requests: 0</pre>
       state.labRunning = true;
       setLabStage("Running");
       setStatus("Running on current locked Lab page");
+      const phaseStatus = document.getElementById("labRuntimePhase");
+      phaseStatus.textContent = "Resolving target";
       syncJourneyControls();
+      let progressRequestActive = false;
+      const pollProgress = async () => {
+        if (progressRequestActive || !state.labRunning) return;
+        progressRequestActive = true;
+        try {
+          const progress = await requestJson("/api/lab/run-status", {
+            studioProfileId: state.profile.id,
+            labSessionToken: state.labSessionToken
+          }, { timeoutMs: 3_000 });
+          if (progress.current) {
+            phaseStatus.textContent =
+              progress.current.label + " · " + progress.current.phase;
+          }
+        } catch {
+          // The execution response remains authoritative; polling is display-only.
+        } finally {
+          progressRequestActive = false;
+        }
+      };
+      const progressTimer = window.setInterval(pollProgress, 250);
       try {
         const json = await requestJson("/api/lab/run", {
           studioProfileId: state.profile.id,
@@ -2457,15 +2489,18 @@ OpenAI requests: 0</pre>
           openAIRequests: json.telemetry.openAIRequests
         }, null, 2);
         setLabStage("Passed");
+        phaseStatus.textContent = "Compilation-independent Lab execution complete.";
         setStatus(json.status, "ok");
         renderLifecycle();
       } catch (error) {
-        state.labRunCompleted = false;
+        state.labRunCompleted = true;
         setLabStage("Failed");
+        phaseStatus.textContent = "Lab execution stopped at the failed phase.";
         setStatus("Lab run failed or stopped", "error");
         document.getElementById("labResult").textContent =
           JSON.stringify(error.response ?? { error: error.message }, null, 2);
       } finally {
+        window.clearInterval(progressTimer);
         state.labRunning = false;
         syncJourneyControls();
       }
@@ -2479,6 +2514,8 @@ OpenAI requests: 0</pre>
           labSessionToken: state.labSessionToken
         });
         state.labRunning = false;
+        document.getElementById("labRuntimePhase").textContent =
+          "Execution stopped by operator.";
         setStatus("Lab run stopped; managed session preserved", "warn");
         document.getElementById("labResult").textContent =
           JSON.stringify(result, null, 2);
@@ -2698,9 +2735,10 @@ app.post("/api/lab/capture-status", async (req, res) => {
   );
   res.json({
     needsCapture: currentFingerprint.sha256 !== capture.fingerprint.sha256,
-    reason: currentFingerprint.sha256 === capture.fingerprint.sha256
-      ? "Structure unchanged — capture reused."
-      : "Structure changed — automatic recapture required.",
+    reason:
+      currentFingerprint.sha256 === capture.fingerprint.sha256
+        ? "Structure unchanged — capture reused."
+        : "Structure changed — automatic recapture required.",
     structuralCompatibility: compatibility.score,
   });
 });
@@ -2928,9 +2966,7 @@ if (allowExplicitLocalSsoFixture) {
           ? "/cgi-professional?legacy=1&frames=1&layout=modified"
           : "/cgi-professional?legacy=1&frames=1";
     try {
-      await session.primaryPage.goto(
-        `${session.applicationOrigin}${pathname}`,
-      );
+      await session.primaryPage.goto(`${session.applicationOrigin}${pathname}`);
       res.json({
         navigated: true,
         canonicalUrl: canonicalizeTargetUrl(session.primaryPage.url()),
@@ -3519,13 +3555,13 @@ app.post("/api/training/run-locked", async (req, res) => {
     return;
   }
   const token =
-    typeof req.body.preflightToken === "string"
-      ? req.body.preflightToken
-      : "";
+    typeof req.body.preflightToken === "string" ? req.body.preflightToken : "";
   const preflight = trainingExecutionPreflights.get(token);
   trainingExecutionPreflights.delete(token);
   if (!preflight || preflight.expiresAt < Date.now()) {
-    res.status(409).json({ error: "Training preflight is missing or expired." });
+    res
+      .status(409)
+      .json({ error: "Training preflight is missing or expired." });
     return;
   }
   try {
@@ -3591,6 +3627,25 @@ app.post("/api/training/run-locked", async (req, res) => {
     });
   }
 });
+app.post("/api/lab/run-status", (req, res) => {
+  const profileId = StudioProfileIdSchema.safeParse(req.body.studioProfileId);
+  if (
+    !profileId.success ||
+    profileId.data !== "ncba-dpi-training" ||
+    !isLabAuthorized(req.body.labSessionToken, profileId.data)
+  ) {
+    res.status(403).json({
+      error: "Active non-clinical LAB MODE Training session required.",
+    });
+    return;
+  }
+  res.json(
+    labRunProgress.get(profileId.data) ?? {
+      running: false,
+      updatedAt: new Date().toISOString(),
+    },
+  );
+});
 app.post("/api/lab/run", async (req, res) => {
   const profileId = StudioProfileIdSchema.safeParse(req.body.studioProfileId);
   if (
@@ -3609,6 +3664,15 @@ app.post("/api/lab/run", async (req, res) => {
   }
   const controller = new AbortController();
   activeLabRuns.set(profileId.data, controller);
+  labRunProgress.set(profileId.data, {
+    running: true,
+    current: {
+      stepId: "pending",
+      phase: "locator-resolution",
+      label: "Resolving target",
+    },
+    updatedAt: new Date().toISOString(),
+  });
   try {
     const prepared = await prepareLockedTrainingExecution(
       String(req.body.workflowId ?? ""),
@@ -3620,6 +3684,14 @@ app.post("/api/lab/run", async (req, res) => {
       workflow: prepared.record.workflow,
       expectedOrigin: prepared.session.applicationOrigin,
       signal: controller.signal,
+      labMode: true,
+      onProgress: (current) => {
+        labRunProgress.set(profileId.data, {
+          running: true,
+          current,
+          updatedAt: new Date().toISOString(),
+        });
+      },
     });
     const passed =
       telemetry.steps.length === prepared.record.workflow.steps.length &&
@@ -3666,6 +3738,12 @@ app.post("/api/lab/run", async (req, res) => {
     });
   } finally {
     activeLabRuns.delete(profileId.data);
+    const current = labRunProgress.get(profileId.data)?.current;
+    labRunProgress.set(profileId.data, {
+      running: false,
+      ...(current ? { current } : {}),
+      updatedAt: new Date().toISOString(),
+    });
   }
 });
 app.post("/api/lab/stop", async (req, res) => {

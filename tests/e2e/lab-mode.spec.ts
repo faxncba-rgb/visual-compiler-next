@@ -14,9 +14,7 @@ async function authenticateAndLock(page: Page) {
       response.url() === `${studioOrigin}/api/managed-browser/open` &&
       response.request().method() === "POST",
   );
-  await page
-    .getByRole("button", { name: "Open in managed browser" })
-    .click();
+  await page.getByRole("button", { name: "Open in managed browser" }).click();
   expect((await openResponsePromise).ok()).toBe(true);
   await expect
     .poll(async () => {
@@ -50,9 +48,7 @@ test("Lab Mode confirms once, auto-captures, falls back on legacy CGI, reruns an
   await page.goto(studioOrigin);
   const labPanel = page.getByLabel("Visual Compiler Lab Mode");
   await expect(labPanel).toBeVisible();
-  await expect(labPanel).toContainText(
-    "LAB MODE — SYNTHETIC TEST ENVIRONMENT",
-  );
+  await expect(labPanel).toContainText("LAB MODE — SYNTHETIC TEST ENVIRONMENT");
 
   await page
     .getByLabel("Application profile", { exact: true })
@@ -145,9 +141,14 @@ test("Lab Mode confirms once, auto-captures, falls back on legacy CGI, reruns an
     '"fallbackSelected": true',
   );
   await expect(page.locator("#labResult")).toContainText('"llmCalls": 0');
-  await expect(page.locator("#labResult")).toContainText(
-    '"openAIRequests": 0',
+  await expect(page.locator("#labResult")).toContainText('"openAIRequests": 0');
+  await expect(page.locator("#labRuntimePhase")).toHaveText(
+    "Compilation-independent Lab execution complete.",
   );
+  await expect(page.locator("#labResult")).toContainText(
+    '"phase": "actionability"',
+  );
+  await expect(page.locator("#labResult")).toContainText('"editableCount":');
   const firstState = await page.request.get(
     `${studioOrigin}/api/test-only/training/cgi-state`,
   );

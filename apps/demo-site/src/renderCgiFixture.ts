@@ -6,6 +6,7 @@ export function renderCgiFixture(
     sameOriginFrameUrl?: string;
     crossOriginFrameUrl?: string;
     modifiedLayout?: boolean;
+    readonlyPrimary?: boolean;
   } = {},
 ) {
   const saveControl = options.legacySaveLinks
@@ -45,6 +46,15 @@ export function renderCgiFixture(
     <p>Fixture locale sans code, contenu ou marque provenant d’un DPI réel.</p>
 
     ${options.modifiedLayout ? "<aside><h2>Navigation synthétique ajoutée</h2></aside>" : ""}
+    ${
+      options.readonlyPrimary
+        ? `<section aria-labelledby="readonly-heading">
+      <h2 id="readonly-heading">Résumé synthétique non modifiable</h2>
+      <label for="readonly-summary">Résumé administratif</label>
+      <textarea id="readonly-summary" readonly>RÉSUMÉ-SYNTHÉTIQUE-LECTURE-SEULE</textarea>
+    </section>`
+        : ""
+    }
     <section aria-labelledby="observation-heading">
       <h2 id="observation-heading">Compte rendu administratif</h2>
       <label for="observation">Observation du praticien</label>
@@ -72,6 +82,7 @@ export function renderCgiFixture(
   </main>
   <script>
     const sections = Array.from(document.querySelectorAll("section"));
+    const editableSections = sections.filter(section => section.querySelector(".save"));
     window.saveForm = (control) => {
       const section = control.closest("section");
       if (section?.querySelector("#observation-result")) {
@@ -82,11 +93,11 @@ export function renderCgiFixture(
           "Note synthétique enregistrée";
       }
     };
-    sections[0].querySelector(".save").addEventListener("click", () => {
+    editableSections[0].querySelector(".save").addEventListener("click", () => {
       document.getElementById("observation-result").textContent =
         "Enregistrement synthétique effectué";
     });
-    sections[1].querySelector(".save").addEventListener("click", () => {
+    editableSections[1].querySelector(".save").addEventListener("click", () => {
       document.getElementById("internal-result").textContent =
         "Note synthétique enregistrée";
     });

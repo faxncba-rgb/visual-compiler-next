@@ -24,6 +24,8 @@ export type PageNode = {
   box: Box;
   visible: boolean;
   enabled: boolean;
+  readOnly?: boolean;
+  contentEditable?: boolean;
   checked?: boolean;
   valueWasPresent?: boolean;
   color?: "green" | "red" | "neutral" | "warning";
@@ -66,6 +68,7 @@ export async function extractPageModel(page: Page | Frame): Promise<PageModel> {
       const tag = el.tagName.toLowerCase();
       if (tag === "button") return "button";
       if (tag === "textarea") return "textbox";
+      if (el.isContentEditable) return "textbox";
       if (tag === "input") {
         const type = el.type;
         if (type === "checkbox") return "checkbox";
@@ -222,6 +225,8 @@ export async function extractPageModel(page: Page | Frame): Promise<PageModel> {
           controlType:
             el instanceof HTMLInputElement
               ? el.type
+              : el.isContentEditable
+                ? "contenteditable"
               : el.tagName.toLowerCase(),
           accessibleName: nameFor(el, role),
           labelText,
@@ -238,6 +243,12 @@ export async function extractPageModel(page: Page | Frame): Promise<PageModel> {
           box: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
           visible,
           enabled: isEnabled(el),
+          readOnly:
+            el instanceof HTMLInputElement ||
+            el instanceof HTMLTextAreaElement
+              ? el.readOnly
+              : undefined,
+          contentEditable: el.isContentEditable || undefined,
           checked:
             el instanceof HTMLInputElement && el.type === "checkbox"
               ? el.checked

@@ -179,9 +179,9 @@ describe("existing managed Page runtime", () => {
     expect(await page.getByRole("textbox").inputValue()).toBe(
       "SYNTHETIC TEST VALUE",
     );
-    await expect.poll(async () => page.locator("#result").textContent()).toBe(
-      "Saved",
-    );
+    await expect
+      .poll(async () => page.locator("#result").textContent())
+      .toBe("Saved");
     expect(telemetry.steps.map((item) => item.status)).toEqual([
       "passed",
       "passed",
@@ -333,8 +333,7 @@ describe("existing managed Page runtime", () => {
       primaryLocator: 'role=link[name="Enregistrer"]',
       selectedLocator: 'a:text-is("Enregistrer")',
       fallbackSelected: true,
-      fallbackReason:
-        "Primary unavailable — deterministic fallback selected.",
+      fallbackReason: "Primary unavailable — deterministic fallback selected.",
       matchCount: 1,
       visibleCount: 1,
       enabledCount: 1,
@@ -364,7 +363,9 @@ describe("existing managed Page runtime", () => {
           <p id="frame-result">Waiting</p>`,
       });
     });
-    await page.setContent(`<iframe name="admin-frame" src="${origin}/frame"></iframe>`);
+    await page.setContent(
+      `<iframe name="admin-frame" src="${origin}/frame"></iframe>`,
+    );
     await page.frames()[1].waitForLoadState();
     const framed = workflow([
       step({
@@ -423,5 +424,367 @@ describe("existing managed Page runtime", () => {
         .locator("#frame-result")
         .textContent(),
     ).toBe("Frame saved");
+  });
+
+  test("rejects a readonly primary immediately and selects the unique semantic editable fallback", async () => {
+    await page.setContent(`<!doctype html><main>
+      <section><h2>Résumé administratif</h2>
+        <textarea readonly>IMMUTABLE SYNTHETIC SUMMARY</textarea>
+      </section>
+      <section><h2>Saisie de la consultation</h2>
+        <textarea id="consultation-note"></textarea>
+        <button id="save-consultation">Enregistrer</button>
+      </section>
+      <section><h2>Note secondaire</h2><textarea></textarea></section>
+      <script>
+        document.querySelector('#save-consultation').addEventListener('click', () => {
+          document.body.dataset.saved = 'once';
+        });
+      </script>
+    </main>`);
+    const selected = workflow([
+      step({
+        id: "fill-consultation",
+        action: "fill",
+        primary: "role=textbox >> nth=0",
+        role: "textbox",
+        value: "SYNTHETIC EDITABLE FALLBACK",
+        postconditions: [
+          {
+            type: "text-visible",
+            target: "SYNTHETIC EDITABLE FALLBACK",
+            expected: "SYNTHETIC EDITABLE FALLBACK",
+          },
+        ],
+      }),
+      step({
+        id: "save-consultation",
+        action: "click",
+        primary: 'role=button[name="Enregistrer"]',
+        role: "button",
+        name: "Enregistrer",
+      }),
+    ]);
+    selected.name =
+      "Dans la zone « Saisie de la consultation », écrire une note puis enregistrer";
+    const started = Date.now();
+    const planned = await inspectWorkflowOnExistingPage({
+      page,
+      workflow: selected,
+      expectedOrigin: origin,
+    });
+    expect(Date.now() - started).toBeLessThan(3_000);
+    expect(planned[0].locator).toMatchObject({
+      selectedLocator: "editable-semantic-fallback",
+      strategy: "editable-semantic-fallback",
+      fallbackReason:
+        "Primary textbox unavailable — unique editable fallback selected.",
+      primaryEditableCount: 0,
+      readOnlyCount: 1,
+      editableCount: 2,
+      isEditable: true,
+      readOnly: false,
+    });
+
+    const progress: string[] = [];
+    const telemetry = await runWorkflowOnExistingPage({
+      page,
+      workflow: selected,
+      expectedOrigin: origin,
+      labMode: true,
+      onProgress: ({ label }) => {
+        progress.push(label);
+      },
+    });
+    expect(await page.locator("#consultation-note").inputValue()).toBe(
+      "SYNTHETIC EDITABLE FALLBACK",
+    );
+    expect(await page.locator("textarea").first().inputValue()).toBe(
+      "IMMUTABLE SYNTHETIC SUMMARY",
+    );
+    expect(await page.locator("body").getAttribute("data-saved")).toBe("once");
+    expect(telemetry.steps[0]).toMatchObject({
+      status: "passed",
+      fillStrategy: "playwright-fill",
+      postconditionNormalized: "input-value",
+    });
+    expect(telemetry.steps[0].phases.map((item) => item.phase)).toEqual([
+      "locator-resolution",
+      "precondition",
+      "actionability",
+      "action",
+      "postcondition",
+    ]);
+    expect(progress).toContain("Checking editability");
+    expect(progress).toContain("Filling field");
+    expect(progress).toContain("Verifying entered value");
+    expect(progress).toContain("Resolving Enregistrer");
+    expect(progress).toContain("Clicking Enregistrer");
+    expect(JSON.stringify(telemetry)).not.toContain(
+      "SYNTHETIC EDITABLE FALLBACK",
+    );
+  });
+
+  test("fills a contenteditable target and normalizes a text-visible fill postcondition", async () => {
+    await page.setContent(`<main>
+      <label id="editor-label">Saisie de la consultation</label>
+      <div id="editor" role="textbox" aria-labelledby="editor-label" contenteditable="true"></div>
+    </main>`);
+    const selected = workflow([
+      step({
+        id: "fill-editor",
+        action: "fill",
+        primary: 'role=textbox[name="Saisie de la consultation"]',
+        role: "textbox",
+        name: "Saisie de la consultation",
+        value: "SYNTHETIC CONTENTEDITABLE",
+        postconditions: [
+          {
+            type: "text-visible",
+            target: "SYNTHETIC CONTENTEDITABLE",
+            expected: "SYNTHETIC CONTENTEDITABLE",
+          },
+        ],
+      }),
+    ]);
+    const telemetry = await runWorkflowOnExistingPage({
+      page,
+      workflow: selected,
+      expectedOrigin: origin,
+      labMode: true,
+    });
+    expect(await page.locator("#editor").textContent()).toBe(
+      "SYNTHETIC CONTENTEDITABLE",
+    );
+    expect(telemetry.steps[0]).toMatchObject({
+      status: "passed",
+      contentEditable: true,
+      fillStrategy: "contenteditable-fill",
+      postconditionNormalized: "input-value",
+    });
+  });
+
+  test("fills contenteditable in a same-origin frame without inspecting cross-origin frames", async () => {
+    await page.context().route(`${origin}/editable-frame`, async (route) => {
+      await route.fulfill({
+        contentType: "text/html",
+        body: `<label id="frame-editor-label">Frame editor</label>
+          <div id="frame-editor" role="textbox" aria-labelledby="frame-editor-label" contenteditable="true"></div>`,
+      });
+    });
+    await page.setContent(
+      `<iframe name="editable-frame" src="${origin}/editable-frame"></iframe>`,
+    );
+    await page.frames()[1].waitForLoadState();
+    const selected = workflow([
+      step({
+        id: "fill-frame-editor",
+        action: "fill",
+        primary: 'role=textbox[name="Frame editor"]',
+        role: "textbox",
+        name: "Frame editor",
+        value: "SYNTHETIC FRAME EDITOR",
+      }),
+    ]);
+    const telemetry = await runWorkflowOnExistingPage({
+      page,
+      workflow: selected,
+      expectedOrigin: origin,
+      labMode: true,
+    });
+    expect(telemetry.steps[0]).toMatchObject({
+      status: "passed",
+      frame: "editable-frame",
+      contentEditable: true,
+      fillStrategy: "contenteditable-fill",
+    });
+    expect(
+      await page
+        .frameLocator('iframe[name="editable-frame"]')
+        .locator("#frame-editor")
+        .textContent(),
+    ).toBe("SYNTHETIC FRAME EDITOR");
+  });
+
+  test("uses keyboard input only after standard fill verification fails", async () => {
+    await page.setContent(`<main>
+      <label for="keyboard-note">Keyboard note</label>
+      <textarea id="keyboard-note"></textarea>
+      <script>
+        let resetOnce = true;
+        document.querySelector('#keyboard-note').addEventListener('input', event => {
+          if (resetOnce) {
+            resetOnce = false;
+            event.currentTarget.value = '';
+          }
+        });
+      </script>
+    </main>`);
+    const selected = workflow([
+      step({
+        id: "keyboard-fill",
+        action: "fill",
+        primary: 'role=textbox[name="Keyboard note"]',
+        role: "textbox",
+        name: "Keyboard note",
+        value: "SYNTHETIC KEYBOARD VALUE",
+      }),
+    ]);
+    const telemetry = await runWorkflowOnExistingPage({
+      page,
+      workflow: selected,
+      expectedOrigin: origin,
+      labMode: true,
+    });
+    expect(await page.locator("#keyboard-note").inputValue()).toBe(
+      "SYNTHETIC KEYBOARD VALUE",
+    );
+    expect(telemetry.steps[0]).toMatchObject({
+      status: "passed",
+      fillStrategy: "keyboard-input",
+      fillAttempts: [
+        {
+          strategy: "playwright-fill",
+          status: "failed",
+          errorRedacted: "Entered value verification failed.",
+        },
+        { strategy: "keyboard-input", status: "passed" },
+      ],
+    });
+  });
+
+  test("uses the native value setter only in Lab mode after DOM fill strategies fail", async () => {
+    await page.setContent(`<main>
+      <label for="native-note">Native note</label>
+      <textarea id="native-note"></textarea>
+      <script>
+        document.querySelector('#native-note').addEventListener('input', event => {
+          if (event instanceof InputEvent) event.currentTarget.value = '';
+        });
+      </script>
+    </main>`);
+    const selected = workflow([
+      step({
+        id: "native-fill",
+        action: "fill",
+        primary: 'role=textbox[name="Native note"]',
+        role: "textbox",
+        name: "Native note",
+        value: "SYNTHETIC NATIVE VALUE",
+      }),
+    ]);
+    const telemetry = await runWorkflowOnExistingPage({
+      page,
+      workflow: selected,
+      expectedOrigin: origin,
+      labMode: true,
+    });
+    expect(await page.locator("#native-note").inputValue()).toBe(
+      "SYNTHETIC NATIVE VALUE",
+    );
+    expect(telemetry.steps[0]).toMatchObject({
+      status: "passed",
+      fillStrategy: "native-value-setter",
+      fillAttempts: [
+        { strategy: "playwright-fill", status: "failed" },
+        { strategy: "keyboard-input", status: "failed" },
+        { strategy: "native-value-setter", status: "passed" },
+      ],
+    });
+    await page.locator("#native-note").evaluate((element) => {
+      (element as HTMLTextAreaElement).value = "";
+    });
+    const outsideLab = await runWorkflowOnExistingPage({
+      page,
+      workflow: selected,
+      expectedOrigin: origin,
+      labMode: false,
+    });
+    expect(outsideLab.steps[0]).toMatchObject({
+      status: "failed",
+      failedPhase: "action",
+      errorRedacted: "Entered value verification failed.",
+    });
+    expect(outsideLab.steps[0].fillAttempts).toHaveLength(2);
+    expect(
+      outsideLab.steps[0].fillAttempts?.map((item) => item.strategy),
+    ).toEqual(["playwright-fill", "keyboard-input"]);
+  });
+
+  test("fails closed on ambiguous editable fallbacks and never clicks save", async () => {
+    await page.setContent(`<main>
+      <textarea readonly></textarea>
+      <section><h2>Saisie de la consultation</h2><textarea></textarea></section>
+      <section><h2>Saisie de la consultation</h2><textarea></textarea></section>
+      <button onclick="document.body.dataset.saved='yes'">Enregistrer</button>
+    </main>`);
+    const selected = workflow([
+      step({
+        id: "ambiguous-fill",
+        action: "fill",
+        primary: "role=textbox >> nth=0",
+        role: "textbox",
+        value: "MUST REMAIN REDACTED",
+      }),
+      step({
+        id: "must-not-save",
+        action: "click",
+        primary: 'role=button[name="Enregistrer"]',
+        role: "button",
+        name: "Enregistrer",
+      }),
+    ]);
+    selected.name = "Écrire dans « Saisie de la consultation »";
+    const telemetry = await runWorkflowOnExistingPage({
+      page,
+      workflow: selected,
+      expectedOrigin: origin,
+      labMode: true,
+    });
+    expect(telemetry.steps).toHaveLength(1);
+    expect(telemetry.steps[0]).toMatchObject({
+      status: "failed",
+      failedPhase: "locator-resolution",
+      errorRedacted: "No unique editable target was found.",
+    });
+    expect(await page.locator("body").getAttribute("data-saved")).toBeNull();
+    expect(JSON.stringify(telemetry)).not.toContain("MUST REMAIN REDACTED");
+  });
+
+  test("stops during the action phase and does not execute a later save", async () => {
+    const controller = new AbortController();
+    const selected = workflow([
+      step({
+        id: "stop-during-fill",
+        action: "fill",
+        primary: "role=textbox >> nth=0",
+        role: "textbox",
+        value: "MUST NOT BE WRITTEN",
+      }),
+      step({
+        id: "must-not-save-after-stop",
+        action: "click",
+        primary: "role=button >> nth=0",
+        role: "button",
+      }),
+    ]);
+    const telemetry = await runWorkflowOnExistingPage({
+      page,
+      workflow: selected,
+      expectedOrigin: origin,
+      labMode: true,
+      signal: controller.signal,
+      onProgress: ({ phase }) => {
+        if (phase === "action") controller.abort();
+      },
+    });
+    expect(telemetry.steps).toHaveLength(1);
+    expect(telemetry.steps[0]).toMatchObject({
+      status: "failed",
+      failedPhase: "action",
+      errorRedacted: "Execution stopped by operator.",
+    });
+    expect(await page.getByRole("textbox").inputValue()).toBe("");
+    expect(await page.locator("#result").textContent()).toBe("Pending");
   });
 });

@@ -186,6 +186,8 @@ export function createRedactedCompilerPageModel(model: PageModel) {
       box: node.box,
       visible: node.visible,
       enabled: node.enabled,
+      readOnly: node.readOnly,
+      contentEditable: node.contentEditable,
       checked: node.checked,
       parentIndex: nearestIncludedAncestor(node.parentId),
       childIndices: children,
@@ -247,8 +249,8 @@ export function createRedactedCompilerPageModel(model: PageModel) {
     redactionReport: {
       nodesCaptured: model.nodes.length,
       nodesIncluded: nodes.length,
-      interactiveElements: nodes.filter((node) =>
-        interactiveRoles.has(node.role ?? "") || node.hasClickHandler,
+      interactiveElements: nodes.filter(
+        (node) => interactiveRoles.has(node.role ?? "") || node.hasClickHandler,
       ).length,
       accessibleNamesKept,
       labelsKept,

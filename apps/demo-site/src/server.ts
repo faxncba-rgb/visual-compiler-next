@@ -1,9 +1,6 @@
 import express from "express";
 import { renderDemoPage, type DemoVariant } from "./renderDemoPage.js";
-import {
-  renderCgiFixture,
-  renderCgiFrameFixture,
-} from "./renderCgiFixture.js";
+import { renderCgiFixture, renderCgiFrameFixture } from "./renderCgiFixture.js";
 import { renderNcbaFixture } from "./renderNcbaFixture.js";
 
 export function createDemoServer(
@@ -32,18 +29,17 @@ export function createDemoServer(
     res.type("html").send(renderNcbaFixture(mode, variant));
   });
   app.get("/cgi-professional", (req, res) => {
-    res
-      .type("html")
-      .send(
-        renderCgiFixture({
-          largeCandidateSet: req.query.large === "1",
-          legacySaveLinks: req.query.legacy === "1",
-          includeFrames: req.query.frames === "1",
-          modifiedLayout: req.query.layout === "modified",
-          sameOriginFrameUrl: "/cgi-frame?frame_token=SYNTHETIC-FRAME-TOKEN",
-          crossOriginFrameUrl: `${syntheticAuthOrigin}/frame?frame_token=SYNTHETIC-CROSS-FRAME-TOKEN`,
-        }),
-      );
+    res.type("html").send(
+      renderCgiFixture({
+        largeCandidateSet: req.query.large === "1",
+        legacySaveLinks: req.query.legacy === "1",
+        includeFrames: req.query.frames === "1",
+        modifiedLayout: req.query.layout === "modified",
+        readonlyPrimary: req.query.readonly === "1",
+        sameOriginFrameUrl: "/cgi-frame?frame_token=SYNTHETIC-FRAME-TOKEN",
+        crossOriginFrameUrl: `${syntheticAuthOrigin}/frame?frame_token=SYNTHETIC-CROSS-FRAME-TOKEN`,
+      }),
+    );
   });
   app.get("/cgi-frame", (_req, res) => {
     res.type("html").send(renderCgiFrameFixture());

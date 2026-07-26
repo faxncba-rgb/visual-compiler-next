@@ -1,10 +1,5 @@
 import { readFile } from "node:fs/promises";
-import {
-  chromium,
-  type Frame,
-  type Locator,
-  type Page,
-} from "playwright";
+import { chromium, type Frame, type Locator, type Page } from "playwright";
 import {
   SemanticWorkflowSchema,
   type SemanticStep,
@@ -47,6 +42,19 @@ export type ExistingPageLocatorEvidence = {
   matchCount: number;
   visibleCount: number;
   enabledCount: number;
+  editableCount: number;
+  readOnlyCount: number;
+  contentEditableCount: number;
+  primaryEditableCount?: number;
+  tagName?: string;
+  inputType?: string;
+  accessibleRole?: string;
+  isVisible?: boolean;
+  isEnabled?: boolean;
+  isEditable?: boolean;
+  readOnly?: boolean;
+  disabled?: boolean;
+  contentEditable?: boolean;
   frame: string;
   unique: true;
 };
@@ -79,9 +87,72 @@ export type ExistingPageTelemetry = {
     matchCount?: number;
     visibleCount?: number;
     enabledCount?: number;
+    editableCount?: number;
+    readOnlyCount?: number;
+    contentEditableCount?: number;
+    primaryEditableCount?: number;
+    tagName?: string;
+    inputType?: string;
+    accessibleRole?: string;
+    isVisible?: boolean;
+    isEnabled?: boolean;
+    isEditable?: boolean;
+    readOnly?: boolean;
+    disabled?: boolean;
+    contentEditable?: boolean;
     frame?: string;
+    failedPhase?: ExistingPageRuntimePhase;
+    phases: ExistingPagePhaseTelemetry[];
+    fillStrategy?: FillStrategy;
+    fillAttempts?: FillAttemptTelemetry[];
+    postconditionNormalized?: "input-value";
     errorRedacted?: string;
   }>;
+};
+
+export type ExistingPageRuntimePhase =
+  | "locator-resolution"
+  | "precondition"
+  | "actionability"
+  | "action"
+  | "postcondition";
+
+export type ExistingPageProgress = {
+  stepId: string;
+  phase: ExistingPageRuntimePhase;
+  label: string;
+};
+
+export type ExistingPagePhaseTelemetry = {
+  phase: ExistingPageRuntimePhase;
+  durationMs: number;
+  status: "passed" | "failed";
+  message?: string;
+};
+
+export type FillStrategy =
+  | "playwright-fill"
+  | "contenteditable-fill"
+  | "keyboard-input"
+  | "native-value-setter";
+
+export type FillAttemptTelemetry = {
+  strategy: FillStrategy;
+  durationMs: number;
+  status: "passed" | "failed";
+  errorRedacted?: string;
+};
+
+type SafeElementState = {
+  tagName: string;
+  inputType?: string;
+  accessibleRole?: string;
+  isVisible: boolean;
+  isEnabled: boolean;
+  isEditable: boolean;
+  readOnly: boolean;
+  disabled: boolean;
+  contentEditable: boolean;
 };
 
 type ResolvedExistingPageLocator = {
@@ -132,9 +203,7 @@ function sameOriginScopes(page: Page, expectedOrigin: string) {
         id:
           frame === page.mainFrame()
             ? "main"
-            : frame.name() ||
-              frameUrl.pathname ||
-              `same-origin-frame-${index}`,
+            : frame.name() || frameUrl.pathname || `same-origin-frame-${index}`,
       };
     });
 }
@@ -179,13 +248,10 @@ function selectorLocator(
       locator: scope
         .locator(textSelector[1])
         .filter({ hasText: textSelector[2] ?? textSelector[3] ?? "" }),
-      strategy:
-        textSelector[1] === "a" ? "anchor-text" : "element-text",
+      strategy: textSelector[1] === "a" ? "anchor-text" : "element-text",
     };
   }
-  const elementOrdinal = selector.match(
-    /^([a-z][a-z0-9-]*)\s*>>\s*nth=(\d+)$/,
-  );
+  const elementOrdinal = selector.match(/^([a-z][a-z0-9-]*)\s*>>\s*nth=(\d+)$/);
   if (elementOrdinal) {
     return {
       locator: scope
@@ -226,15 +292,23 @@ async function attemptSelector(
   selector: string,
   visibleOnly: boolean,
   enabledOnly: boolean,
+  requireEditable = false,
   scopedContainer?: Locator,
 ) {
   const scopes = scopedContainer
     ? [{ scope: scopedContainer, id: "previous-step-container" }]
     : sameOriginScopes(page, expectedOrigin);
-  const eligibleMatches: Array<{ locator: Locator; frame: string }> = [];
+  const eligibleMatches: Array<{
+    locator: Locator;
+    frame: string;
+    state: SafeElementState;
+  }> = [];
   let matchCount = 0;
   let visibleCount = 0;
   let enabledCount = 0;
+  let editableCount = 0;
+  let readOnlyCount = 0;
+  let contentEditableCount = 0;
   let strategy = "unknown";
   for (const scopeEntry of scopes) {
     const resolved = selectorLocator(scopeEntry.scope, selector);
@@ -244,12 +318,28 @@ async function attemptSelector(
     matchCount += count;
     for (let index = 0; index < count; index += 1) {
       const candidate = resolved.locator.nth(index);
-      const visible = await candidate.isVisible().catch(() => false);
-      const enabled = await candidate.isEnabled().catch(() => false);
+      const state = await safeElementState(candidate);
+      const visible = state.isVisible;
+      const enabled = state.isEnabled;
       visibleCount += Number(visible);
       enabledCount += Number(visible && enabled);
-      if ((!visibleOnly || visible) && (!enabledOnly || enabled)) {
-        eligibleMatches.push({ locator: candidate, frame: scopeEntry.id });
+      editableCount += Number(visible && enabled && state.isEditable);
+      readOnlyCount += Number(state.readOnly);
+      contentEditableCount += Number(state.contentEditable);
+      if (
+        (!visibleOnly || visible) &&
+        (!enabledOnly || enabled) &&
+        (!requireEditable ||
+          (state.isEditable &&
+            !state.readOnly &&
+            !state.disabled &&
+            isTextCompatible(state)))
+      ) {
+        eligibleMatches.push({
+          locator: candidate,
+          frame: scopeEntry.id,
+          state,
+        });
       }
     }
   }
@@ -259,7 +349,286 @@ async function attemptSelector(
     matchCount,
     visibleCount,
     enabledCount,
+    editableCount,
+    readOnlyCount,
+    contentEditableCount,
     eligibleMatches,
+  };
+}
+
+function inferredRole(
+  tagName: string,
+  inputType?: string,
+  explicitRole?: string,
+) {
+  if (explicitRole) return explicitRole;
+  if (tagName === "textarea") return "textbox";
+  if (tagName === "button") return "button";
+  if (tagName === "select") return "combobox";
+  if (tagName === "a") return "link";
+  if (tagName === "input") {
+    if (["checkbox", "radio", "button", "submit"].includes(inputType ?? "")) {
+      return inputType === "submit" || inputType === "button"
+        ? "button"
+        : inputType;
+    }
+    return "textbox";
+  }
+  return undefined;
+}
+
+function isTextCompatible(state: SafeElementState) {
+  if (state.contentEditable) return true;
+  if (state.tagName === "textarea") return true;
+  return (
+    state.tagName === "input" &&
+    ![
+      "button",
+      "checkbox",
+      "color",
+      "file",
+      "hidden",
+      "image",
+      "radio",
+      "range",
+      "reset",
+      "submit",
+    ].includes(state.inputType ?? "text")
+  );
+}
+
+async function safeElementState(locator: Locator): Promise<SafeElementState> {
+  const domState = await locator
+    .evaluate((element) => {
+      const html = element as HTMLElement;
+      const control = element as HTMLInputElement | HTMLTextAreaElement;
+      return {
+        tagName: element.tagName.toLowerCase(),
+        inputType:
+          element instanceof HTMLInputElement
+            ? element.type.toLowerCase()
+            : undefined,
+        explicitRole: element.getAttribute("role")?.toLowerCase() || undefined,
+        readOnly: "readOnly" in control ? Boolean(control.readOnly) : false,
+        disabled: "disabled" in control ? Boolean(control.disabled) : false,
+        contentEditable: html.isContentEditable,
+      };
+    })
+    .catch(() => ({
+      tagName: "unknown",
+      inputType: undefined,
+      explicitRole: undefined,
+      readOnly: false,
+      disabled: false,
+      contentEditable: false,
+    }));
+  const [isVisible, isEnabled, isEditable] = await Promise.all([
+    locator.isVisible().catch(() => false),
+    locator.isEnabled().catch(() => false),
+    locator.isEditable({ timeout: 1_500 }).catch(() => false),
+  ]);
+  return {
+    tagName: domState.tagName,
+    inputType: domState.inputType,
+    accessibleRole: inferredRole(
+      domState.tagName,
+      domState.inputType,
+      domState.explicitRole,
+    ),
+    isVisible,
+    isEnabled,
+    isEditable,
+    readOnly: domState.readOnly,
+    disabled: domState.disabled,
+    contentEditable: domState.contentEditable,
+  };
+}
+
+function evidenceFromAttempt(
+  step: SemanticStep,
+  selectedLocator: string,
+  fallbackReason: string | undefined,
+  attempt: Awaited<ReturnType<typeof attemptSelector>>,
+): ExistingPageLocatorEvidence {
+  const selected = attempt.eligibleMatches[0];
+  const state = selected.state;
+  return {
+    stepId: step.id,
+    primaryLocator: step.selectedLocator!.primary,
+    selectedLocator,
+    fallbackSelected: selectedLocator !== step.selectedLocator!.primary,
+    ...(fallbackReason ? { fallbackReason } : {}),
+    strategy: attempt.strategy,
+    matchCount: attempt.matchCount,
+    visibleCount: attempt.visibleCount,
+    enabledCount: attempt.enabledCount,
+    editableCount: attempt.editableCount,
+    readOnlyCount: attempt.readOnlyCount,
+    contentEditableCount: attempt.contentEditableCount,
+    tagName: state.tagName,
+    inputType: state.inputType,
+    accessibleRole: state.accessibleRole,
+    isVisible: state.isVisible,
+    isEnabled: state.isEnabled,
+    isEditable: state.isEditable,
+    readOnly: state.readOnly,
+    disabled: state.disabled,
+    contentEditable: state.contentEditable,
+    frame: selected.frame,
+    unique: true,
+  };
+}
+
+function semanticHints(step: SemanticStep, workflowName: string) {
+  const hints = new Set<string>();
+  for (const source of [
+    step.target.accessibleName,
+    step.selectedLocator?.rule?.candidateText,
+    step.intent,
+    workflowName,
+  ]) {
+    if (!source) continue;
+    for (const match of source.matchAll(
+      /[«\u201c"]([^»\u201d"]+)[»\u201d"]/g,
+    )) {
+      const hint = match[1]?.trim().toLocaleLowerCase();
+      if (hint && hint !== step.value?.trim().toLocaleLowerCase()) {
+        hints.add(hint);
+      }
+    }
+  }
+  return [...hints];
+}
+
+async function resolveEditableFallback(
+  page: Page,
+  expectedOrigin: string,
+  step: SemanticStep,
+  workflowName: string,
+) {
+  const candidates: Array<{
+    locator: Locator;
+    frame: string;
+    state: SafeElementState;
+    score: number;
+  }> = [];
+  const hints = semanticHints(step, workflowName);
+  for (const { scope, id } of sameOriginScopes(page, expectedOrigin)) {
+    const locator = scope.locator(
+      'textarea, input:not([type]), input[type="text"], input[type="search"], input[type="email"], input[type="url"], input[type="tel"], [contenteditable="true"], [role="textbox"]',
+    );
+    for (let index = 0; index < (await locator.count()); index += 1) {
+      const candidate = locator.nth(index);
+      const state = await safeElementState(candidate);
+      if (
+        !state.isVisible ||
+        !state.isEnabled ||
+        !state.isEditable ||
+        state.readOnly ||
+        state.disabled ||
+        !isTextCompatible(state)
+      ) {
+        continue;
+      }
+      const anchorTexts = step.target.relations
+        .map((relation) => relation.anchorText)
+        .filter((value): value is string => Boolean(value));
+      const semantics = await candidate.evaluate((element, expectedAnchors) => {
+        const id = element.getAttribute("id");
+        const labels = id
+          ? [...document.querySelectorAll("label")]
+              .filter((label) => label.htmlFor === id)
+              .map((label) => label.textContent?.trim() ?? "")
+          : [];
+        const parentLabel = element.closest("label")?.textContent?.trim() ?? "";
+        const container = element.closest(
+          "section, fieldset, form, article, main",
+        );
+        const heading =
+          container
+            ?.querySelector("legend, h1, h2, h3, h4, h5, h6")
+            ?.textContent?.trim() ?? "";
+        const hasRelatedAnchor = [
+          ...(container?.querySelectorAll(
+            "button, a, [role=button], input[type=submit]",
+          ) ?? []),
+        ].some((control) => {
+          const label =
+            control instanceof HTMLInputElement
+              ? control.value
+              : (control.textContent?.trim() ?? "");
+          return expectedAnchors.includes(label);
+        });
+        return {
+          ariaLabel: element.getAttribute("aria-label") ?? "",
+          placeholder: element.getAttribute("placeholder") ?? "",
+          labels: [...labels, parentLabel].filter(Boolean),
+          heading,
+          hasRelatedAnchor,
+        };
+      }, anchorTexts);
+      const normalized = [
+        semantics.ariaLabel,
+        semantics.placeholder,
+        ...semantics.labels,
+        semantics.heading,
+      ]
+        .filter(Boolean)
+        .map((text) => text.toLocaleLowerCase());
+      let score = 0;
+      for (const hint of hints) {
+        if (normalized.some((text) => text === hint)) {
+          score = Math.max(score, 100);
+        } else if (
+          normalized.some((text) => text.includes(hint) || hint.includes(text))
+        ) {
+          score = Math.max(score, 70);
+        }
+      }
+      if (semantics.hasRelatedAnchor) score += 20;
+      candidates.push({ locator: candidate, frame: id, state, score });
+    }
+  }
+  if (candidates.length === 0) return undefined;
+  const ordered = [...candidates].sort((a, b) => b.score - a.score);
+  const winner = ordered[0];
+  if (
+    ordered.length > 1 &&
+    (winner.score === 0 || winner.score === ordered[1].score)
+  ) {
+    return undefined;
+  }
+  return {
+    locator: winner.locator,
+    evidence: {
+      stepId: step.id,
+      primaryLocator: step.selectedLocator!.primary,
+      selectedLocator: "editable-semantic-fallback",
+      fallbackSelected: true,
+      fallbackReason:
+        "Primary textbox unavailable — unique editable fallback selected.",
+      strategy: "editable-semantic-fallback",
+      matchCount: candidates.length,
+      visibleCount: candidates.length,
+      enabledCount: candidates.length,
+      editableCount: candidates.length,
+      readOnlyCount: 0,
+      contentEditableCount: candidates.filter(
+        (item) => item.state.contentEditable,
+      ).length,
+      primaryEditableCount: 0,
+      tagName: winner.state.tagName,
+      inputType: winner.state.inputType,
+      accessibleRole: winner.state.accessibleRole,
+      isVisible: winner.state.isVisible,
+      isEnabled: winner.state.isEnabled,
+      isEditable: winner.state.isEditable,
+      readOnly: winner.state.readOnly,
+      disabled: winner.state.disabled,
+      contentEditable: winner.state.contentEditable,
+      frame: winner.frame,
+      unique: true as const,
+    },
   };
 }
 
@@ -267,6 +636,7 @@ async function resolveSelectedLocator(
   page: Page,
   step: SemanticStep,
   expectedOrigin: string,
+  workflowName: string,
   previous?: ResolvedExistingPageLocator,
 ): Promise<ResolvedExistingPageLocator> {
   const selected = step.selectedLocator;
@@ -284,11 +654,9 @@ async function resolveSelectedLocator(
   const semanticArtifactFallbacks = artifactFallbacks.filter(
     (selector) => !positionalSelector(selector),
   );
-  const positionalArtifactFallbacks = artifactFallbacks.filter(
-    positionalSelector,
-  );
-  const targetName =
-    step.target.accessibleName ?? selected.rule?.candidateText;
+  const positionalArtifactFallbacks =
+    artifactFallbacks.filter(positionalSelector);
+  const targetName = step.target.accessibleName ?? selected.rule?.candidateText;
   const synthesizedSemanticFallbacks: string[] = [];
   if (targetName) {
     synthesizedSemanticFallbacks.push(
@@ -305,9 +673,7 @@ async function resolveSelectedLocator(
     ...semanticArtifactFallbacks,
     ...synthesizedSemanticFallbacks,
   ].filter((selector, index, all) => all.indexOf(selector) === index);
-  let primaryAttempt:
-    | Awaited<ReturnType<typeof attemptSelector>>
-    | undefined;
+  let primaryAttempt: Awaited<ReturnType<typeof attemptSelector>> | undefined;
   for (const [index, selector] of semanticSelectors.entries()) {
     const attempt = await attemptSelector(
       page,
@@ -315,30 +681,41 @@ async function resolveSelectedLocator(
       selector,
       visibleOnly,
       enabledOnly,
+      step.action === "fill",
     );
     if (index === 0) primaryAttempt = attempt;
     if (attempt.eligibleMatches.length === 1) {
       return {
         locator: attempt.eligibleMatches[0].locator,
-        evidence: {
-          stepId: step.id,
-          primaryLocator: selected.primary,
-          selectedLocator: selector,
-          fallbackSelected: selector !== selected.primary,
-          ...(selector !== selected.primary
-            ? {
-                fallbackReason:
-                  "Primary unavailable — deterministic fallback selected.",
-              }
-            : {}),
-          strategy: attempt.strategy,
-          matchCount: attempt.matchCount,
-          visibleCount: attempt.visibleCount,
-          enabledCount: attempt.enabledCount,
-          frame: attempt.eligibleMatches[0].frame,
-          unique: true,
-        },
+        evidence: evidenceFromAttempt(
+          step,
+          selector,
+          selector !== selected.primary
+            ? "Primary unavailable — deterministic fallback selected."
+            : undefined,
+          attempt,
+        ),
       };
+    }
+  }
+  if (
+    step.action === "fill" &&
+    (primaryAttempt?.visibleCount ?? 0) > 0 &&
+    (primaryAttempt?.editableCount ?? 0) === 0
+  ) {
+    const editableFallback = await resolveEditableFallback(
+      page,
+      expectedOrigin,
+      step,
+      workflowName,
+    );
+    if (editableFallback) {
+      editableFallback.evidence.primaryEditableCount =
+        primaryAttempt?.editableCount ?? 0;
+      editableFallback.evidence.readOnlyCount =
+        primaryAttempt?.readOnlyCount ??
+        editableFallback.evidence.readOnlyCount;
+      return editableFallback;
     }
   }
   if (targetName && previous) {
@@ -356,24 +733,21 @@ async function resolveSelectedLocator(
           selector,
           visibleOnly,
           enabledOnly,
+          false,
           container,
         );
         if (attempt.eligibleMatches.length === 1) {
           return {
             locator: attempt.eligibleMatches[0].locator,
             evidence: {
-              stepId: step.id,
-              primaryLocator: selected.primary,
-              selectedLocator: `previous-step-container >> ${selector}`,
-              fallbackSelected: true,
-              fallbackReason:
+              ...evidenceFromAttempt(
+                step,
+                `previous-step-container >> ${selector}`,
                 "Primary unavailable — deterministic fallback selected.",
+                attempt,
+              ),
               strategy: "previous-step-dom-relation",
-              matchCount: attempt.matchCount,
-              visibleCount: attempt.visibleCount,
-              enabledCount: attempt.enabledCount,
               frame: previous.evidence.frame,
-              unique: true,
             },
           };
         }
@@ -388,29 +762,24 @@ async function resolveSelectedLocator(
       selector,
       visibleOnly,
       enabledOnly,
+      step.action === "fill",
     );
     if (attempt.eligibleMatches.length === 1) {
       return {
         locator: attempt.eligibleMatches[0].locator,
-        evidence: {
-          stepId: step.id,
-          primaryLocator: selected.primary,
-          selectedLocator: selector,
-          fallbackSelected: true,
-          fallbackReason:
-            "Primary unavailable — deterministic fallback selected.",
-          strategy: attempt.strategy,
-          matchCount: attempt.matchCount,
-          visibleCount: attempt.visibleCount,
-          enabledCount: attempt.enabledCount,
-          frame: attempt.eligibleMatches[0].frame,
-          unique: true,
-        },
+        evidence: evidenceFromAttempt(
+          step,
+          selector,
+          "Primary unavailable — deterministic fallback selected.",
+          attempt,
+        ),
       };
     }
   }
   throw new Error(
-    `Step ${step.id} locator resolution failed: primary matches=${primaryAttempt?.matchCount ?? 0}, visible=${primaryAttempt?.visibleCount ?? 0}, enabled=${primaryAttempt?.enabledCount ?? 0}; no unique deterministic fallback.`,
+    step.action === "fill"
+      ? `Step ${step.id} locator resolution failed: primary matches=${primaryAttempt?.matchCount ?? 0}, visible=${primaryAttempt?.visibleCount ?? 0}, enabled=${primaryAttempt?.enabledCount ?? 0}, editable=${primaryAttempt?.editableCount ?? 0}; no unique editable target.`
+      : `Step ${step.id} locator resolution failed: primary matches=${primaryAttempt?.matchCount ?? 0}, visible=${primaryAttempt?.visibleCount ?? 0}, enabled=${primaryAttempt?.enabledCount ?? 0}; no unique deterministic fallback.`,
   );
 }
 
@@ -541,6 +910,197 @@ async function verifyStepPostconditions(
   await verifyStepAssertions(page, target, step.postconditions);
 }
 
+function normalizedControlText(value: string) {
+  return value.replace(/\r\n/g, "\n").trim();
+}
+
+async function readControlText(target: Locator, state: SafeElementState) {
+  if (state.contentEditable) {
+    return target.textContent({ timeout: 3_000 }).then((value) => value ?? "");
+  }
+  return target.inputValue({ timeout: 3_000 });
+}
+
+async function verifyEnteredValue(
+  target: Locator,
+  state: SafeElementState,
+  expected: string,
+) {
+  const actual = await readControlText(target, state).catch(() => {
+    throw new Error("Entered value verification failed.");
+  });
+  if (normalizedControlText(actual) !== normalizedControlText(expected)) {
+    throw new Error("Entered value verification failed.");
+  }
+}
+
+function throwIfStopped(signal?: AbortSignal) {
+  if (signal?.aborted) throw new Error("Execution stopped by operator.");
+}
+
+async function abortable<T>(promise: Promise<T>, signal?: AbortSignal) {
+  if (!signal) return promise;
+  throwIfStopped(signal);
+  return Promise.race([
+    promise,
+    new Promise<never>((_, reject) => {
+      signal.addEventListener(
+        "abort",
+        () => reject(new Error("Execution stopped by operator.")),
+        { once: true },
+      );
+    }),
+  ]);
+}
+
+function redactedFillFailure(error: unknown) {
+  const message = error instanceof Error ? error.message : "";
+  if (/stopped by operator/i.test(message)) {
+    return "Execution stopped by operator.";
+  }
+  if (/not editable|readonly|read-only/i.test(message)) {
+    return "Selected element is visible but not editable.";
+  }
+  if (/no unique editable/i.test(message)) {
+    return "No unique editable target was found.";
+  }
+  if (/timeout/i.test(message)) return "Fill action timed out.";
+  if (/verification failed/i.test(message)) {
+    return "Entered value verification failed.";
+  }
+  return "Fill strategy failed.";
+}
+
+async function executeFillWithStrategies(input: {
+  target: Locator;
+  value: string;
+  state: SafeElementState;
+  labMode: boolean;
+  signal?: AbortSignal;
+}) {
+  const attempts: FillAttemptTelemetry[] = [];
+  const attempt = async (
+    strategy: FillStrategy,
+    operation: () => Promise<unknown>,
+  ) => {
+    const started = Date.now();
+    try {
+      throwIfStopped(input.signal);
+      await abortable(Promise.resolve(operation()), input.signal);
+      throwIfStopped(input.signal);
+      await verifyEnteredValue(input.target, input.state, input.value);
+      attempts.push({
+        strategy,
+        durationMs: Date.now() - started,
+        status: "passed",
+      });
+      return true;
+    } catch (error) {
+      attempts.push({
+        strategy,
+        durationMs: Date.now() - started,
+        status: "failed",
+        errorRedacted: redactedFillFailure(error),
+      });
+      if (
+        error instanceof Error &&
+        /stopped by operator/i.test(error.message)
+      ) {
+        throw error;
+      }
+      return false;
+    }
+  };
+
+  const initialStrategy: FillStrategy = input.state.contentEditable
+    ? "contenteditable-fill"
+    : "playwright-fill";
+  if (
+    await attempt(initialStrategy, async () => {
+      await input.target.scrollIntoViewIfNeeded({ timeout: 3_000 });
+      await input.target.focus({ timeout: 3_000 });
+      await input.target.fill(input.value, { timeout: 8_000 });
+    })
+  ) {
+    return { strategy: initialStrategy, attempts };
+  }
+
+  if (
+    await attempt("keyboard-input", async () => {
+      await input.target.scrollIntoViewIfNeeded({ timeout: 3_000 });
+      await input.target.focus({ timeout: 3_000 });
+      await input.target.press("ControlOrMeta+A", { timeout: 3_000 });
+      await input.target.pressSequentially(input.value, {
+        delay: 12,
+        timeout: 8_000,
+      });
+      await input.target.press("Tab", { timeout: 3_000 });
+    })
+  ) {
+    return { strategy: "keyboard-input" as const, attempts };
+  }
+
+  if (
+    input.labMode &&
+    !input.state.contentEditable &&
+    ["input", "textarea"].includes(input.state.tagName) &&
+    (await attempt("native-value-setter", async () => {
+      await input.target.evaluate((element, value) => {
+        const control = element as HTMLInputElement | HTMLTextAreaElement;
+        if (control.readOnly || control.disabled) {
+          throw new Error("Selected element is not editable.");
+        }
+        const prototype =
+          element instanceof HTMLTextAreaElement
+            ? HTMLTextAreaElement.prototype
+            : HTMLInputElement.prototype;
+        const setter = Object.getOwnPropertyDescriptor(prototype, "value")?.set;
+        if (!setter) throw new Error("Native value setter unavailable.");
+        setter.call(control, value);
+        control.dispatchEvent(new Event("input", { bubbles: true }));
+        control.dispatchEvent(new Event("change", { bubbles: true }));
+        control.blur();
+      }, input.value);
+    }))
+  ) {
+    return { strategy: "native-value-setter" as const, attempts };
+  }
+
+  throw Object.assign(new Error("Entered value verification failed."), {
+    fillAttempts: attempts,
+  });
+}
+
+async function verifyExistingPostconditions(
+  page: Page,
+  target: Locator,
+  step: SemanticStep,
+  state: SafeElementState,
+) {
+  let normalized = false;
+  for (const assertion of step.postconditions) {
+    const expected = String(assertion.expected ?? assertion.target);
+    if (
+      step.action === "fill" &&
+      assertion.type === "text-visible" &&
+      step.value !== undefined &&
+      expected === step.value
+    ) {
+      await verifyEnteredValue(target, state, step.value);
+      normalized = true;
+      continue;
+    }
+    await verifyStepAssertions(page, target, [assertion]);
+  }
+  if (step.action === "fill" && step.value !== undefined) {
+    await verifyEnteredValue(target, state, step.value);
+    normalized ||= step.postconditions.some(
+      (assertion) => assertion.type === "text-visible",
+    );
+  }
+  return normalized;
+}
+
 async function runStepWithTarget(
   page: Page,
   step: SemanticStep,
@@ -584,6 +1144,7 @@ export async function inspectWorkflowOnExistingPage(input: {
       input.page,
       step,
       input.expectedOrigin,
+      input.workflow.name,
       previous,
     );
     await verifyStepAssertions(
@@ -610,6 +1171,8 @@ export async function runWorkflowOnExistingPage(input: {
   workflow: SemanticWorkflow;
   expectedOrigin: string;
   signal?: AbortSignal;
+  labMode?: boolean;
+  onProgress?: (progress: ExistingPageProgress) => void | Promise<void>;
 }): Promise<ExistingPageTelemetry> {
   const startedAt = new Date().toISOString();
   const started = Date.now();
@@ -642,21 +1205,146 @@ export async function runWorkflowOnExistingPage(input: {
   for (const step of input.workflow.steps) {
     const stepStarted = Date.now();
     let resolved: ResolvedExistingPageLocator | undefined;
+    let state: SafeElementState | undefined;
+    let fillResult:
+      Awaited<ReturnType<typeof executeFillWithStrategies>> | undefined;
+    let failedPhase: ExistingPageRuntimePhase | undefined;
+    let postconditionNormalized = false;
+    const phases: ExistingPagePhaseTelemetry[] = [];
+    const phase = async <T>(
+      phaseName: ExistingPageRuntimePhase,
+      label: string,
+      operation: () => Promise<T>,
+    ) => {
+      const phaseStarted = Date.now();
+      await input.onProgress?.({ stepId: step.id, phase: phaseName, label });
+      try {
+        const result = await operation();
+        phases.push({
+          phase: phaseName,
+          durationMs: Date.now() - phaseStarted,
+          status: "passed",
+        });
+        return result;
+      } catch (error) {
+        failedPhase = phaseName;
+        phases.push({
+          phase: phaseName,
+          durationMs: Date.now() - phaseStarted,
+          status: "failed",
+          message:
+            step.action === "fill"
+              ? redactedFillFailure(error)
+              : "Phase failed.",
+        });
+        throw error;
+      }
+    };
     try {
-      if (input.signal?.aborted) throw new Error("Execution stopped by operator.");
-      resolved = await resolveSelectedLocator(
-        input.page,
-        step,
-        input.expectedOrigin,
-        previous,
+      throwIfStopped(input.signal);
+      resolved = await phase(
+        "locator-resolution",
+        step.action === "click"
+          ? `Resolving ${selectedLocatorLabel(step)}`
+          : "Resolving target",
+        () =>
+          resolveSelectedLocator(
+            input.page,
+            step,
+            input.expectedOrigin,
+            input.workflow.name,
+            previous,
+          ),
       );
-      await verifyStepAssertions(
-        input.page,
-        resolved.locator,
-        step.preconditions,
+      await phase("precondition", "Checking preconditions", () =>
+        verifyStepAssertions(input.page, resolved!.locator, step.preconditions),
       );
-      await runStepWithTarget(input.page, step, resolved.locator);
-      if (input.signal?.aborted) throw new Error("Execution stopped by operator.");
+      state = await phase(
+        "actionability",
+        step.action === "fill"
+          ? "Checking editability"
+          : "Checking actionability",
+        async () => {
+          const current = await safeElementState(resolved!.locator);
+          if (!current.isVisible) {
+            throw new Error("Selected element is not visible.");
+          }
+          if (!current.isEnabled || current.disabled) {
+            throw new Error("Selected element is disabled.");
+          }
+          if (
+            step.action === "fill" &&
+            (!current.isEditable ||
+              current.readOnly ||
+              !isTextCompatible(current))
+          ) {
+            throw new Error("Selected element is visible but not editable.");
+          }
+          return current;
+        },
+      );
+      await phase(
+        "action",
+        step.action === "fill"
+          ? "Filling field"
+          : step.action === "click"
+            ? `Clicking ${selectedLocatorLabel(step)}`
+            : `Running ${step.action}`,
+        async () => {
+          throwIfStopped(input.signal);
+          if (step.action === "fill") {
+            fillResult = await executeFillWithStrategies({
+              target: resolved!.locator,
+              value: step.value ?? "",
+              state: state!,
+              labMode: input.labMode === true,
+              signal: input.signal,
+            });
+          } else {
+            await abortable(
+              (async () => {
+                if (step.action === "check")
+                  await resolved!.locator.check({ timeout: 8_000 });
+                else if (step.action === "uncheck")
+                  await resolved!.locator.uncheck({ timeout: 8_000 });
+                else if (step.action === "click")
+                  await resolved!.locator.click({ timeout: 8_000 });
+                else if (step.action === "select")
+                  await resolved!.locator.selectOption(step.value ?? "", {
+                    timeout: 8_000,
+                  });
+                else if (step.action === "wait")
+                  await resolved!.locator.waitFor({
+                    state: "visible",
+                    timeout: 8_000,
+                  });
+                else if (step.action === "assert")
+                  await resolved!.locator.waitFor({
+                    state: "visible",
+                    timeout: 8_000,
+                  });
+                else
+                  throw new Error(`Unsupported runtime action: ${step.action}`);
+              })(),
+              input.signal,
+            );
+          }
+        },
+      );
+      postconditionNormalized = await phase(
+        "postcondition",
+        step.action === "fill"
+          ? "Verifying entered value"
+          : "Verifying postconditions",
+        () =>
+          verifyExistingPostconditions(
+            input.page,
+            resolved!.locator,
+            step,
+            state!,
+          ),
+      );
+      throwIfStopped(input.signal);
       assertPageOrigin(input.page, input.expectedOrigin);
       steps.push({
         stepId: step.id,
@@ -670,7 +1358,30 @@ export async function runWorkflowOnExistingPage(input: {
         matchCount: resolved.evidence.matchCount,
         visibleCount: resolved.evidence.visibleCount,
         enabledCount: resolved.evidence.enabledCount,
+        editableCount: resolved.evidence.editableCount,
+        readOnlyCount: resolved.evidence.readOnlyCount,
+        contentEditableCount: resolved.evidence.contentEditableCount,
+        primaryEditableCount: resolved.evidence.primaryEditableCount,
+        tagName: state.tagName,
+        inputType: state.inputType,
+        accessibleRole: state.accessibleRole,
+        isVisible: state.isVisible,
+        isEnabled: state.isEnabled,
+        isEditable: state.isEditable,
+        readOnly: state.readOnly,
+        disabled: state.disabled,
+        contentEditable: state.contentEditable,
         frame: resolved.evidence.frame,
+        phases,
+        ...(fillResult
+          ? {
+              fillStrategy: fillResult.strategy,
+              fillAttempts: fillResult.attempts,
+            }
+          : {}),
+        ...(postconditionNormalized
+          ? { postconditionNormalized: "input-value" as const }
+          : {}),
       });
       previous = resolved;
     } catch (error) {
@@ -688,13 +1399,42 @@ export async function runWorkflowOnExistingPage(input: {
               matchCount: resolved.evidence.matchCount,
               visibleCount: resolved.evidence.visibleCount,
               enabledCount: resolved.evidence.enabledCount,
+              editableCount: resolved.evidence.editableCount,
+              readOnlyCount: resolved.evidence.readOnlyCount,
+              contentEditableCount: resolved.evidence.contentEditableCount,
+              primaryEditableCount: resolved.evidence.primaryEditableCount,
+              tagName: resolved.evidence.tagName,
+              inputType: resolved.evidence.inputType,
+              accessibleRole: resolved.evidence.accessibleRole,
+              isVisible: resolved.evidence.isVisible,
+              isEnabled: resolved.evidence.isEnabled,
+              isEditable: resolved.evidence.isEditable,
+              readOnly: resolved.evidence.readOnly,
+              disabled: resolved.evidence.disabled,
+              contentEditable: resolved.evidence.contentEditable,
               frame: resolved.evidence.frame,
             }
           : {}),
+        failedPhase,
+        phases,
+        ...(fillResult
+          ? {
+              fillStrategy: fillResult.strategy,
+              fillAttempts: fillResult.attempts,
+            }
+          : error && typeof error === "object" && "fillAttempts" in error
+            ? {
+                fillAttempts: (
+                  error as { fillAttempts: FillAttemptTelemetry[] }
+                ).fillAttempts,
+              }
+            : {}),
         errorRedacted:
           error instanceof Error && /stopped by operator/i.test(error.message)
             ? "Execution stopped by operator."
-            : "Locator, precondition, action, or postcondition failed.",
+            : step.action === "fill"
+              ? redactedFillFailure(error)
+              : "Locator, precondition, action, or postcondition failed.",
       });
       break;
     }
