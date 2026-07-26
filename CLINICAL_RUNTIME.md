@@ -9,3 +9,9 @@ The expected operator display is `Workflow approved`, `Structural compatibility:
 The optional compatibility probe is disabled by default, excluded from CI, and has never been run against the real DPI. A future authorized operator may launch it manually in a visible browser after confirmation. It must aggregate only DOM/control/iframe/Shadow DOM/canvas/SPA/stable-label counts and immediately discard temporary page data.
 
 The **Test run on locked Training page** feature is intentionally separate from this clinical runtime. It accepts Draft workflows only, reuses the current synthetic Training session, and can mark a successful Draft as Validated. It cannot approve, promote, or execute a clinical workflow. Clinical execution continues to require a promoted artifact and the full clinical preflight.
+
+The existing-page Training/Lab runtime now verifies editability before `fill`
+and fails closed on readonly, disabled, or ambiguous targets. Standard
+Playwright and keyboard strategies are value-verified. The native value-setter
+fallback is explicitly Lab-only and is never enabled by the clinical runtime.
+It cannot remove readonly/disabled state, repair locators, or bypass preflight.

@@ -11,6 +11,10 @@
 
 ## Unreleased
 
+- Added editability-aware existing-page resolution, safe control-state/count telemetry, deterministic editable fallbacks, and fail-closed ambiguity handling.
+- Added verified standard, contenteditable, keyboard, and Lab-only native-setter fill strategies with short timeouts and redacted phase/attempt telemetry.
+- Normalized entered-value postconditions, prevented save clicks after failed fills, exposed live Lab action phases, and enabled compatible Run again after failure.
+- Added a readonly-first CGI fixture plus unit/E2E coverage for contenteditable, same-origin frames, fallback strategies, Stop, redaction, and zero OpenAI calls.
 - Added a loopback-only Lab Mode with one synthetic-session confirmation, automatic capture reuse, explicit compile/restore, direct Draft testing, repeat runs, stop, and reset controls.
 - Added a seven-stage Lab progress display with bounded operations, concurrent-call refusal, redacted compile/run telemetry, and reusable failure states.
 - Corrected legacy CGI anchors without `href`: page modeling retains only safe onclick presence, while runtime uses unique semantic/DOM fallbacks before positional selectors and reports the actual candidate used.

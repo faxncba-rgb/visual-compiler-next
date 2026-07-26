@@ -36,10 +36,19 @@ redaction, cross-origin frame exclusion, deterministic locator uniqueness, and
 zero-call runtime telemetry. Lab tokens, full navigation URLs, browser state,
 and authentication origins are never persisted.
 
+Lab fill resolution requires one visible, enabled, editable, text-compatible
+target and records only safe state booleans/counts. Readonly and disabled
+controls are never mutated. The final native value-setter strategy is restricted
+to local Lab Mode, standard input/textarea controls, and the already unique
+target; it cannot run in clinical mode. Every strategy verifies the resulting
+control value in memory, but neither the expected nor actual value enters
+telemetry or logs.
+
 For legacy CGI controls, the page model records `hasClickHandler: true` but
 never the handler source. Anchors without `href` or an explicit link role are
 not represented as accessible links. Runtime fallback selection is local and
-deterministic; it stops closed when no single visible and enabled target exists.
+deterministic; actions stop closed when no single visible, enabled, and—when
+filling—editable target exists.
 Same-origin frame identity contains only name/title/canonical pathname (index as
 a last resort), while cross-origin frame DOM is never added to capture or model
 payloads.

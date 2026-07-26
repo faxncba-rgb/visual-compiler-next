@@ -1,5 +1,18 @@
 # Progress
 
+## 2026-07-26 — Lab editability diagnostics and verified fill fallback
+
+- Confirmed the real failure mechanism without contacting the DPI or OpenAI: the primary `role=textbox >> nth=0` could be visible and enabled but readonly, while existing resolution did not test editability and Playwright `fill()` inherited a 30-second timeout.
+- Added per-locator safe state and counts (`tagName`, input type, inferred role, visible, enabled, editable, readonly, disabled, contenteditable) plus phase telemetry for locator resolution, preconditions, actionability, action, and postconditions. No field value or dynamic URL is included.
+- `fill` now rejects a non-editable primary before acting and ranks editable standard controls or `contenteditable` in the main page and same-origin frames using workflow-provided semantics, labels, structural headings, related controls, and deterministic DOM order. Ambiguity fails closed.
+- Added bounded, value-verified fill strategies: Playwright fill, keyboard input, and a final native setter restricted to Lab Mode and standard non-readonly/non-disabled controls. The runtime emits only strategy names, duration, pass/fail, and redacted reason.
+- Normalized fill `text-visible` postconditions to control-value checks when they describe the value just entered. A failed verification stops before **Enregistrer**; no retry clicks or locator mutation occur.
+- Studio now polls a token-authenticated POST status endpoint and visibly reports the active redacted runtime phase. **Run again** is available after a completed failure without capture or compilation when the existing managed session remains compatible.
+- Added a local CGI `readonly=1` fixture, contenteditable and same-origin frame coverage, keyboard/native fallback tests, ambiguous-target refusal, Stop-during-action coverage, and E2E proof that the readonly first textbox remains unchanged while the intended section is filled and saved once.
+- The two user-owned real workflow files remain local, untracked, and byte-identical. No real artifact was modified or executed; no DPI or OpenAI request occurred during this milestone.
+- Final clean validation: `npm ci` reported 0 vulnerabilities; build passed; 60/60 unit and integration tests passed; 9/9 focused security tests plus an 85-file repository scan passed; and 16/16 Playwright E2E tests passed.
+- Visual loopback verification confirmed the `ncba-dpi-training` profile, `TRAINING` mode, Lab journey, **Run again**, **Stop**, `Runtime ready — no active action.`, locked-Training preflight controls, and zero-call counters. The local run E2E additionally rendered phase/actionability telemetry and the readonly fallback result.
+
 ## 2026-07-25 — Local Lab Mode and legacy CGI replay
 
 - Added explicit `VISUAL_COMPILER_LAB_MODE=true`, restricted to a loopback-bound Studio, Training/fixture profiles, and one in-memory synthetic-record confirmation per session. Clinical mode refuses the Lab endpoints and never renders the Lab panel.

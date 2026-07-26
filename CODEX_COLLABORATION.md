@@ -35,6 +35,14 @@ refused in Clinical mode. Old-CGI and frame support may retain structural
 semantics only—never onclick source, field values, cross-origin frame content,
 query parameters, cookies, storage, headers, or authentication state.
 
+For the editability-recovery milestone, Codex may inspect only bounded locator
+metadata from the local untracked workflow and must preserve its bytes. All
+runtime development and visual validation use the readonly/contenteditable CGI
+fixtures. Codex must not retry the real workflow, contact the DPI, or invoke
+OpenAI. Fill telemetry may contain structural control state, phase, strategy,
+counts, duration, and redacted errors only—never the requested value or current
+page contents.
+
 ## Components Codex Designed
 
 - Monorepo structure separating compile-time and runtime packages.
