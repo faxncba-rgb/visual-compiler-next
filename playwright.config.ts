@@ -29,7 +29,7 @@ export default defineConfig({
     },
     {
       command:
-        "VISUAL_COMPILER_LAB_MODE=true USE_LIVE_OPENAI=false MANAGED_BROWSER_HEADLESS=true STUDIO_HOST=127.0.0.1 STUDIO_PORT=3100 DEMO_SITE_INTERNAL_URL=http://127.0.0.1:4273 DEMO_SITE_PUBLIC_URL=http://127.0.0.1:4273 NCBA_TRAINING_ORIGIN=http://127.0.0.1:4273 ALLOW_EXPLICIT_LOCAL_SSO_FIXTURE=true SSO_FIXTURE_AUTH_ORIGIN=http://127.0.0.1:4275 WORKFLOW_STORAGE_DIR=/private/tmp/visual-compiler-next-e2e-workflows E2E_SEED_WORKFLOW_PATH=compiled-workflows/pending-review.workflow.json npm run dev:studio",
+        "VISUAL_COMPILER_LAB_MODE=true USE_LIVE_OPENAI=false MANAGED_BROWSER_HEADLESS=true STUDIO_HOST=127.0.0.1 STUDIO_PORT=3100 DEMO_SITE_INTERNAL_URL=http://127.0.0.1:4273 DEMO_SITE_PUBLIC_URL=http://127.0.0.1:4273 NCBA_TRAINING_ORIGIN=http://127.0.0.1:4273 ALLOW_EXPLICIT_LOCAL_SSO_FIXTURE=true SSO_FIXTURE_AUTH_ORIGIN=http://127.0.0.1:4275 WORKFLOW_STORAGE_DIR=/tmp/visual-compiler-next-e2e-workflows E2E_SEED_WORKFLOW_PATH=compiled-workflows/pending-review.workflow.json npm run dev:studio",
       url: "http://127.0.0.1:3100/health",
       reuseExistingServer: false,
       timeout: 30_000,
