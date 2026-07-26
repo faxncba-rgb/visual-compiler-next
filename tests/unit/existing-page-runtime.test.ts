@@ -438,7 +438,9 @@ describe("existing managed Page runtime", () => {
       <section><h2>Note secondaire</h2><textarea></textarea></section>
       <script>
         document.querySelector('#save-consultation').addEventListener('click', () => {
-          document.body.dataset.saved = 'once';
+          document.body.dataset.saved = String(
+            Number(document.body.dataset.saved || '0') + 1
+          );
         });
       </script>
     </main>`);
@@ -502,7 +504,7 @@ describe("existing managed Page runtime", () => {
     expect(await page.locator("textarea").first().inputValue()).toBe(
       "IMMUTABLE SYNTHETIC SUMMARY",
     );
-    expect(await page.locator("body").getAttribute("data-saved")).toBe("once");
+    expect(await page.locator("body").getAttribute("data-saved")).toBe("1");
     expect(telemetry.steps[0]).toMatchObject({
       status: "passed",
       fillStrategy: "playwright-fill",
@@ -515,6 +517,21 @@ describe("existing managed Page runtime", () => {
       "action",
       "postcondition",
     ]);
+    expect(telemetry.steps[0].phases[2]).toMatchObject({
+      phase: "actionability",
+      selector: "editable-semantic-fallback",
+      strategy: "editable-semantic-fallback",
+      tagName: "textarea",
+      accessibleRole: "textbox",
+      isVisible: true,
+      isEnabled: true,
+      isEditable: true,
+      readOnly: false,
+      disabled: false,
+      contentEditable: false,
+      frame: "main",
+      editableCount: 2,
+    });
     expect(progress).toContain("Checking editability");
     expect(progress).toContain("Filling field");
     expect(progress).toContain("Verifying entered value");
@@ -568,8 +585,7 @@ describe("existing managed Page runtime", () => {
     await page.context().route(`${origin}/editable-frame`, async (route) => {
       await route.fulfill({
         contentType: "text/html",
-        body: `<label id="frame-editor-label">Frame editor</label>
-          <div id="frame-editor" role="textbox" aria-labelledby="frame-editor-label" contenteditable="true"></div>`,
+        body: `<body id="frame-editor" role="textbox" aria-label="Frame editor" contenteditable="true"></body>`,
       });
     });
     await page.setContent(

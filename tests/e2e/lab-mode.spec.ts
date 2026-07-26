@@ -122,10 +122,11 @@ test("Lab Mode confirms once, auto-captures, falls back on legacy CGI, reruns an
   });
   await page.locator("#labRun").click();
   await expect(page.locator("#status")).toContainText(/failed/i);
+  await expect(page.locator("#labRunAgain")).toBeEnabled();
   await page.request.post(`${studioOrigin}/api/test-only/training/navigate`, {
     data: { destination: "cgi" },
   });
-  await page.locator("#labRun").click();
+  await page.locator("#labRunAgain").click();
   await expect
     .poll(async () => page.locator("#status").innerText())
     .toMatch(/Lab run passed|Lab run failed/);

@@ -127,6 +127,20 @@ export type ExistingPagePhaseTelemetry = {
   phase: ExistingPageRuntimePhase;
   durationMs: number;
   status: "passed" | "failed";
+  strategy?: string;
+  selector?: string;
+  tagName?: string;
+  inputType?: string;
+  accessibleRole?: string;
+  isVisible?: boolean;
+  isEnabled?: boolean;
+  isEditable?: boolean;
+  readOnly?: boolean;
+  disabled?: boolean;
+  contentEditable?: boolean;
+  frame?: string;
+  matchCount?: number;
+  editableCount?: number;
   message?: string;
 };
 
@@ -1220,18 +1234,62 @@ export async function runWorkflowOnExistingPage(input: {
       await input.onProgress?.({ stepId: step.id, phase: phaseName, label });
       try {
         const result = await operation();
+        const phaseResolved =
+          phaseName === "locator-resolution"
+            ? (result as ResolvedExistingPageLocator)
+            : resolved;
+        const phaseState =
+          phaseName === "actionability" ? (result as SafeElementState) : state;
+        const evidence = phaseResolved?.evidence;
         phases.push({
           phase: phaseName,
           durationMs: Date.now() - phaseStarted,
           status: "passed",
+          strategy: evidence?.strategy,
+          selector:
+            evidence?.selectedLocator ??
+            step.selectedLocator?.primary ??
+            "missing",
+          tagName: phaseState?.tagName ?? evidence?.tagName,
+          inputType: phaseState?.inputType ?? evidence?.inputType,
+          accessibleRole:
+            phaseState?.accessibleRole ?? evidence?.accessibleRole,
+          isVisible: phaseState?.isVisible ?? evidence?.isVisible,
+          isEnabled: phaseState?.isEnabled ?? evidence?.isEnabled,
+          isEditable: phaseState?.isEditable ?? evidence?.isEditable,
+          readOnly: phaseState?.readOnly ?? evidence?.readOnly,
+          disabled: phaseState?.disabled ?? evidence?.disabled,
+          contentEditable:
+            phaseState?.contentEditable ?? evidence?.contentEditable,
+          frame: evidence?.frame,
+          matchCount: evidence?.matchCount,
+          editableCount: evidence?.editableCount,
         });
         return result;
       } catch (error) {
+        const evidence = resolved?.evidence;
         failedPhase = phaseName;
         phases.push({
           phase: phaseName,
           durationMs: Date.now() - phaseStarted,
           status: "failed",
+          strategy: evidence?.strategy,
+          selector:
+            evidence?.selectedLocator ??
+            step.selectedLocator?.primary ??
+            "missing",
+          tagName: state?.tagName ?? evidence?.tagName,
+          inputType: state?.inputType ?? evidence?.inputType,
+          accessibleRole: state?.accessibleRole ?? evidence?.accessibleRole,
+          isVisible: state?.isVisible ?? evidence?.isVisible,
+          isEnabled: state?.isEnabled ?? evidence?.isEnabled,
+          isEditable: state?.isEditable ?? evidence?.isEditable,
+          readOnly: state?.readOnly ?? evidence?.readOnly,
+          disabled: state?.disabled ?? evidence?.disabled,
+          contentEditable: state?.contentEditable ?? evidence?.contentEditable,
+          frame: evidence?.frame,
+          matchCount: evidence?.matchCount,
+          editableCount: evidence?.editableCount,
           message:
             step.action === "fill"
               ? redactedFillFailure(error)
